@@ -2,8 +2,8 @@
 set -e
 
 # Метаданные скрипта
-SCRIPT_VERSION="1.0.15"
-SCRIPT_DATE="2025-05-14 13:51:12"
+SCRIPT_VERSION="1.1.1"
+SCRIPT_DATE="2025-05-14 14:30:00"
 SCRIPT_AUTHOR="gopnikgame"
 
 # Цветовые коды
@@ -64,11 +64,6 @@ log() {
 # Функция отката изменений
 rollback() {
     log "ERROR" "Произошла ошибка. Выполняется откат изменений..."
-    if [ -f "$BACKUP_DIR/resolved.conf" ]; then
-        cp "$BACKUP_DIR/resolved.conf" /etc/systemd/resolved.conf || true
-        systemctl unmask systemd-resolved || true
-        systemctl restart systemd-resolved || true
-    fi
     exit 1
 }
 
@@ -114,14 +109,14 @@ backup_file() {
 # Установка зависимостей и обновление системы
 install_dependencies_and_update_system() {
     log "INFO" "Установка зависимостей и обновление системы..."
-    print_header "Установка зависимостей и обновление системы"
+    print_header "Установка зависимых пакетов и обновление системы"
     
     # Список необходимых пакетов
     local required_packages=(
         curl wget git htop neofetch mc
         net-tools nmap tcpdump iotop
         unzip tar vim tmux screen
-        rsync ncdu dnsutils resolvconf
+        rsync ncdu dnsutils
         whois ufw openssh-server
         mtr
     )
@@ -197,775 +192,66 @@ install_dependencies_and_update_system() {
     return 0
 }
 
-
-# Настройка DNS через systemd-resolved
-configure_dns() {
-    log "INFO" "Настройка DNS через systemd-resolved..."
-    print_header "Настройка DNS"
+# Установка DNSCrypt через внешний скрипт
+install_dnscrypt() {
+    log "INFO" "Установка DNSCrypt-proxy..."
+    print_header "Установка DNSCrypt-proxy"
     
-    # Проверка, работаем ли мы в контейнере или виртуализированной среде
-    check_virtualization() {
-        log "INFO" "Проверка среды выполнения..."
-        
-        if [ -f "/.dockerenv" ] || grep -q "docker\|lxc\|container" /proc/1/cgroup 2>/dev/null; then
-            log "INFO" "Обнаружено выполнение в контейнере"
-            return 0
-        elif command -v systemd-detect-virt >/dev/null && systemd-detect-virt -q 2>/dev/null; then
-            virt_type=$(systemd-detect-virt 2>/dev/null)
-            log "INFO" "Обнаружена виртуализация: $virt_type"
-            return 0
-        fi
-        
-        log "INFO" "Среда выполнения: физический хост"
+    print_step "DNSCrypt-proxy обеспечивает шифрование DNS-запросов"
+    print_step "и защиту от прослушивания и подмены DNS-ответов."
+    echo
+    
+    # Проверяем наличие curl
+    if ! command -v curl &> /dev/null; then
+        log "ERROR" "curl не найден. Пожалуйста, установите curl сначала."
+        print_error "Требуется установить зависимости (curl) перед установкой DNSCrypt."
         return 1
-    }
+    fi
     
-    # Получение текущих настроек DNS
-    get_current_dns_settings() {
-        print_step "Получение текущих настроек DNS..."
-        
-        # Переменные для хранения текущих настроек
-        local current_dns_servers="Не удалось определить"
-        local current_caching="Не удалось определить"
-        local current_dnssec="Не удалось определить"
-        local current_dnstls="Не удалось определить"
-        
-        # Проверка наличия resolved.conf
-        if [ -f "/etc/systemd/resolved.conf" ]; then
-            log "INFO" "Чтение настроек из /etc/systemd/resolved.conf..."
-            
-            # Получение значений DNS серверов
-            local dns_servers=$(grep -E "^DNS=" /etc/systemd/resolved.conf 2>/dev/null | cut -d'=' -f2)
-            if [ -n "$dns_servers" ]; then
-                current_dns_servers="$dns_servers"
-            fi
-            
-            # Проверка настроек кеширования
-            if grep -q "^Cache=yes" /etc/systemd/resolved.conf 2>/dev/null; then
-                current_caching="Включено"
-            elif grep -q "^Cache=no" /etc/systemd/resolved.conf 2>/dev/null; then
-                current_caching="Отключено"
-            fi
-            
-            # Проверка DNSSEC
-            if grep -q "^DNSSEC=yes" /etc/systemd/resolved.conf 2>/dev/null; then
-                current_dnssec="Включено"
-            elif grep -q "^DNSSEC=no" /etc/systemd/resolved.conf 2>/dev/null; then
-                current_dnssec="Отключено"
-            fi
-            
-            # Проверка DNS-over-TLS
-            if grep -q "^DNSOverTLS=yes" /etc/systemd/resolved.conf 2>/dev/null; then
-                current_dnstls="Включено"
-            elif grep -q "^DNSOverTLS=no" /etc/systemd/resolved.conf 2>/dev/null; then
-                current_dnstls="Отключено"
-            fi
-        fi
-        
-        # Проверка через resolvectl, если доступно
-        if command -v resolvectl &> /dev/null; then
-            log "INFO" "Проверка настроек через resolvectl..."
-            local resolvectl_dns=$(resolvectl dns 2>/dev/null | grep -v "Link " | sed 's/.*: //' | tr '\n' ' ')
-            
-            if [ -n "$resolvectl_dns" ] && [ "$resolvectl_dns" != " " ]; then
-                current_dns_servers="$resolvectl_dns"
-            fi
-            
-            # Проверка DNSSEC через resolvectl
-            if resolvectl status 2>/dev/null | grep -q "DNSSEC setting: yes"; then
-                current_dnssec="Включено"
-            elif resolvectl status 2>/dev/null | grep -q "DNSSEC setting: no"; then
-                current_dnssec="Отключено"
-            fi
-            
-            # Проверка кеширования через systemd-resolve
-            if resolvectl statistics 2>/dev/null | grep -q "Cache entries:"; then
-                if resolvectl statistics 2>/dev/null | grep -E "Cache entries: [1-9][0-9]*"; then
-                    current_caching="Включено (активно используется)"
-                else
-                    current_caching="Включено (не используется)"
-                fi
-            fi
-        fi
-        
-        # Вывод текущих настроек DNS
-        echo -e "\n${YELLOW}=== Текущие настройки DNS ===${NC}"
-        echo -e "${CYAN}DNS серверы:${NC}     $current_dns_servers"
-        echo -e "${CYAN}Кеширование DNS:${NC} $current_caching"
-        echo -e "${CYAN}DNSSEC:${NC}          $current_dnssec"
-        echo -e "${CYAN}DNS-over-TLS:${NC}    $current_dnstls"
-        echo
-        
-        # Возвращаем статус кеширования
-        case "$current_caching" in
-            "Включено"*) 
-                return 0
-                ;;
-            *)
-                return 1
-                ;;
-        esac
-    }
+    # URL скрипта установки
+    local DNSCRYPT_INSTALL_URL="https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/main/quick_install.sh"
     
-    # Проверяем среду выполнения
-    is_virtualized=0
-    check_virtualization && is_virtualized=1
-
-    # Проверка состояния systemd-resolved
-    if systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
-        log "INFO" "systemd-resolved уже включен."
+    print_step "Загрузка скрипта установки DNSCrypt..."
+    
+    # Создаем временную директорию
+    local temp_dir=$(mktemp -d)
+    local install_script="$temp_dir/dnscrypt_install.sh"
+    
+    # Скачиваем скрипт
+    if curl -fsSL "$DNSCRYPT_INSTALL_URL" -o "$install_script"; then
+        log "INFO" "Скрипт установки успешно загружен."
+        print_success "Скрипт установки загружен."
     else
-        log "INFO" "Размаскировка и включение systemd-resolved..."
-        systemctl unmask systemd-resolved || true
-        systemctl enable systemd-resolved || true
+        log "ERROR" "Не удалось загрузить скрипт установки DNSCrypt."
+        print_error "Ошибка загрузки скрипта. Проверьте подключение к интернету."
+        rm -rf "$temp_dir"
+        return 1
     fi
-
-    # Создание резервной копии текущей конфигурации
-    if [ -f "/etc/systemd/resolved.conf" ]; then
-        backup_file "/etc/systemd/resolved.conf"
-    fi
-
-    # Отображение текущих настроек DNS и проверка кеширования
-    local cache_was_enabled=0
-    get_current_dns_settings && cache_was_enabled=1
-
-    # Объявление массивов DNS-серверов (убраны неработоспособные)
-    declare -A DNS_PROVIDERS
-    DNS_PROVIDERS=(
-        ["Google"]="8.8.8.8#dns.google 8.8.4.4#dns.google"
-        ["Cloudflare"]="1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com"
-        ["AdGuard"]="94.140.14.14#dns.adguard.com 94.140.15.15#dns.adguard.com"
-        ["Quad9"]="9.9.9.9#dns.quad9.net 149.112.112.112#dns.quad9.net"
-        ["OpenDNS"]="208.67.222.222#dns.opendns.com 208.67.220.220#dns.opendns.com"
-        ["NextDNS"]="45.90.28.0#nextdns.io 45.90.30.0#nextdns.io"
-        ["UncensoredDNS"]="91.239.100.100#anycast.censurfridns.dk 89.233.43.71#unicast.censurfridns.dk"
-    )
-
-    # Показать пользователю меню выбора DNS
-    echo -e "${YELLOW}=== Выбор основного DNS провайдера ===${NC}"
-    echo "1. Google DNS      (8.8.8.8, 8.8.4.4)"
-    echo "2. Cloudflare DNS  (1.1.1.1, 1.0.0.1)"
-    echo "3. AdGuard DNS     (94.140.14.14, 94.140.15.15)"
-    echo "4. Quad9 DNS       (9.9.9.9, 149.112.112.112)"
-    echo "5. OpenDNS         (208.67.222.222, 208.67.220.220)" 
-    echo "6. NextDNS         (45.90.28.0, 45.90.30.0)"
-    echo "7. UncensoredDNS   (91.239.100.100, 89.233.43.71)"
-    echo ""
-    read -p "Выберите основной DNS провайдер [1-7, по умолчанию 1]: " dns_choice
-
-    # Определение основного и резервных DNS на основе выбора
-    local primary_dns
-    local fallback_dns1
-    local fallback_dns2
-
-    case "$dns_choice" in
-        2)  # Cloudflare как основной
-            primary_dns="${DNS_PROVIDERS["Cloudflare"]}"
-            fallback_dns1="${DNS_PROVIDERS["Google"]}"
-            fallback_dns2="${DNS_PROVIDERS["AdGuard"]}"
-            log "INFO" "Выбран Cloudflare DNS в качестве основного."
-            ;;
-        3)  # AdGuard как основной
-            primary_dns="${DNS_PROVIDERS["AdGuard"]}"
-            fallback_dns1="${DNS_PROVIDERS["Google"]}"
-            fallback_dns2="${DNS_PROVIDERS["Cloudflare"]}"
-            log "INFO" "Выбран AdGuard DNS в качестве основного."
-            ;;
-        4)  # Quad9 как основной
-            primary_dns="${DNS_PROVIDERS["Quad9"]}"
-            fallback_dns1="${DNS_PROVIDERS["Google"]}"
-            fallback_dns2="${DNS_PROVIDERS["Cloudflare"]}"
-            log "INFO" "Выбран Quad9 DNS в качестве основного."
-            ;;
-        5)  # OpenDNS как основной
-            primary_dns="${DNS_PROVIDERS["OpenDNS"]}"
-            fallback_dns1="${DNS_PROVIDERS["Google"]}"
-            fallback_dns2="${DNS_PROVIDERS["Cloudflare"]}"
-            log "INFO" "Выбран OpenDNS в качестве основного."
-            ;;
-        6)  # NextDNS как основной
-            primary_dns="${DNS_PROVIDERS["NextDNS"]}"
-            fallback_dns1="${DNS_PROVIDERS["Google"]}"
-            fallback_dns2="${DNS_PROVIDERS["Cloudflare"]}"
-            log "INFO" "Выбран NextDNS в качестве основного."
-            ;;
-        7)  # UncensoredDNS как основной
-            primary_dns="${DNS_PROVIDERS["UncensoredDNS"]}"
-            fallback_dns1="${DNS_PROVIDERS["Google"]}"
-            fallback_dns2="${DNS_PROVIDERS["Cloudflare"]}"
-            log "INFO" "Выбран UncensoredDNS в качестве основного."
-            ;;
-        *)  # Google как основной (по умолчанию)
-            primary_dns="${DNS_PROVIDERS["Google"]}"
-            fallback_dns1="${DNS_PROVIDERS["Cloudflare"]}"
-            fallback_dns2="${DNS_PROVIDERS["AdGuard"]}"
-            log "INFO" "Выбран Google DNS в качестве основного."
-            ;;
-    esac
-
-    # Настройка кеширования DNS
-    echo -e "\n${YELLOW}=== Настройка кеширования DNS ===${NC}"
-    echo "Кеширование DNS может ускорить разрешение имён за счёт сохранения"
-    echo "результатов запросов в памяти системы."
-    read -p "Включить кеширование DNS? [y/n, по умолчанию y]: " enable_cache
     
-    local cache_setting="yes"
-    local cache_from_localhost="yes"
+    # Делаем скрипт исполняемым
+    chmod +x "$install_script"
     
-    if [[ "$enable_cache" =~ ^[Nn]$ ]]; then
-        cache_setting="no"
-        cache_from_localhost="no"
-        log "INFO" "Кеширование DNS отключено пользователем."
+    print_step "Запуск скрипта установки DNSCrypt..."
+    echo
+    
+    # Запускаем скрипт установки
+    if bash "$install_script"; then
+        log "INFO" "DNSCrypt-proxy успешно установлен."
+        print_success "DNSCrypt-proxy успешно установлен и настроен."
     else
-        log "INFO" "Кеширование DNS включено."
-    fi
-
-    # Создание новой конфигурации resolved
-    cat > /etc/systemd/resolved.conf << EOF
-[Resolve]
-# Основной DNS
-DNS=$primary_dns
-FallbackDNS=$fallback_dns1 $fallback_dns2
-Domains=~.
-DNSOverTLS=yes
-DNSSEC=yes
-
-# Кеширование DNS
-Cache=$cache_setting
-CacheFromLocalhost=$cache_from_localhost
-DNSStubListener=yes
-EOF
-
-    # Проверка и настройка resolv.conf
-    log "INFO" "Настройка /etc/resolv.conf..."
-    
-    # Получение первого IP из выбранного DNS без DoH суффикса
-    primary_ip=$(echo "$primary_dns" | cut -d'#' -f1 | awk '{print $1}')
-    
-    # Проверяем, можно ли изменить resolv.conf
-    if [ -f "/etc/resolv.conf" ]; then
-        # Проверка на immutable бит
-        if command -v lsattr >/dev/null 2>&1; then
-            log "INFO" "Проверка атрибутов /etc/resolv.conf..."
-            lsattr_output=$(lsattr /etc/resolv.conf 2>/dev/null || echo "")
-            
-            if echo "$lsattr_output" | grep -q "i"; then
-                log "INFO" "Обнаружен immutable бит на /etc/resolv.conf. Снимаем..."
-                chattr -i /etc/resolv.conf 2>/dev/null || true
-            fi
-        fi
-        
-        # Сохраняем резервную копию
-        if [ ! -L "/etc/resolv.conf" ]; then
-            backup_file "/etc/resolv.conf"
-            log "INFO" "Сохранена резервная копия /etc/resolv.conf"
-        fi
-        
-        # Пытаемся удалить существующий файл
-        rm -f "/etc/resolv.conf" 2>/dev/null || true
+        log "ERROR" "Ошибка при установке DNSCrypt-proxy."
+        print_error "Произошла ошибка при установке DNSCrypt."
+        rm -rf "$temp_dir"
+        return 1
     fi
     
-    # Если удалось удалить старый файл, создаем символьную ссылку
-    if [ ! -f "/etc/resolv.conf" ] && ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf; then
-        log "INFO" "✓ Символическая ссылка /etc/resolv.conf успешно создана."
-    else
-        log "WARNING" "⚠ Не удалось создать символическую ссылку /etc/resolv.conf."
-        
-        # Если символьная ссылка не удалась, и мы в виртуализированной среде
-        if [ $is_virtualized -eq 1 ]; then
-            log "INFO" "Используем альтернативные методы настройки DNS в виртуализированной среде..."
-            
-            # Используем resolvectl для настройки DNS, если он доступен
-            if command -v resolvectl >/dev/null 2>&1; then
-                log "INFO" "Настройка DNS через resolvectl..."
-                
-                # Разбиваем DNS-строки на отдельные серверы
-                IFS=' ' read -ra PRIMARY_SERVERS <<< "$primary_dns"
-                
-                # Получаем список активных интерфейсов, кроме lo
-                interfaces=$(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
-                
-                # Если список интерфейсов пуст, используем хотя бы основной интерфейс
-                if [ -z "$interfaces" ]; then
-                    interfaces=$(ip route | grep default | awk '{print $5}')
-                fi
-                
-                # Применяем для всех интерфейсов
-                for iface in $interfaces; do
-                    for dns_server in "${PRIMARY_SERVERS[@]}"; do
-                        dns_ip=$(echo "$dns_server" | cut -d'#' -f1)
-                        resolvectl dns "$iface" "$dns_ip" >/dev/null 2>&1 || true
-                    done
-                    resolvectl domain "$iface" "~." >/dev/null 2>&1 || true
-                    log "INFO" "Настроен DNS для интерфейса: $iface"
-                done
-            fi
-            
-            # Как запасной вариант, используем resolvconf, если он доступен
-            if command -v resolvconf >/dev/null 2>&1; then
-                log "INFO" "Применение настроек через resolvconf..."
-                
-                mkdir -p /etc/resolvconf/resolv.conf.d
-                cat > /etc/resolvconf/resolv.conf.d/head << EOF
-# Настроено скриптом ubuntu_pre_install.sh
-# Дата: $(date "+%Y-%m-%d %H:%M:%S")
-nameserver $primary_ip
-nameserver 127.0.0.53
-options edns0 trust-ad
-search .
-EOF
-                
-                resolvconf -u
-                log "INFO" "Настройки применены через resolvconf"
-            fi
-            
-            # Если ничего не помогло, пытаемся создать напрямую
-            if [ ! -f "/etc/resolv.conf" ] || ! grep -q "$primary_ip" /etc/resolv.conf; then
-                log "INFO" "Пытаемся создать файл resolv.conf напрямую..."
-                
-                # Создаем временный файл и затем перемещаем его
-                temp_file=$(mktemp)
-                cat > "$temp_file" << EOF
-# Создано скриптом ubuntu_pre_install.sh
-# Дата: $(date "+%Y-%m-%d %H:%M:%S")
-nameserver $primary_ip
-nameserver 127.0.0.53
-options edns0 trust-ad
-search .
-EOF
-                
-                # Пробуем скопировать файл вместо перемещения
-                cat "$temp_file" > /etc/resolv.conf 2>/dev/null || true
-                rm -f "$temp_file"
-                
-                if grep -q "$primary_ip" /etc/resolv.conf; then
-                    log "INFO" "✓ Файл /etc/resolv.conf успешно создан."
-                else
-                    log "WARNING" "⚠ Не удалось настроить /etc/resolv.conf напрямую."
-                    log "INFO" "Попробуйте выполнить настройку DNS вручную после перезагрузки."
-                    
-                    # Сохраняем настройки в файл для ручного применения
-                    echo -e "${YELLOW}Выбранные DNS-серверы:${NC}" > /root/dns_settings.txt
-                    echo "Основной: $primary_dns" >> /root/dns_settings.txt
-                    echo "Резервный 1: $fallback_dns1" >> /root/dns_settings.txt
-                    echo "Резервный 2: $fallback_dns2" >> /root/dns_settings.txt
-                    echo -e "\nДля ручной настройки используйте команду:" >> /root/dns_settings.txt
-                    echo "echo 'nameserver $primary_ip' > /etc/resolv.conf" >> /root/dns_settings.txt
-                    
-                    log "INFO" "Сохранены настройки DNS в файл /root/dns_settings.txt"
-                fi
-            fi
-        else
-            # Для физического хоста
-            log "INFO" "Настройка DNS для физического хоста..."
-            
-            # Перезапускаем systemd-resolved даже при ошибках
-            systemctl restart systemd-resolved || true
-            
-            # Проверяем, работает ли системный резолвер
-            nslookup google.com 127.0.0.53 >/dev/null 2>&1
-            if [ $? -eq 0 ]; then
-                log "INFO" "✓ Системный резолвер (127.0.0.53) работает."
-            else
-                log "WARNING" "⚠ Системный резолвер не работает. Настраиваем напрямую..."
-                
-                # Пытаемся создать файл resolv.conf напрямую
-                cat > /etc/resolv.conf.new << EOF
-# Создано скриптом ubuntu_pre_install.sh
-# Дата: $(date "+%Y-%m-%d %H:%M:%S")
-nameserver $primary_ip
-options edns0
-EOF
-                
-                # Пытаемся заменить файл
-                cat /etc/resolv.conf.new > /etc/resolv.conf 2>/dev/null || true
-                rm -f /etc/resolv.conf.new
-            fi
-        fi
-    fi
-
-    # Если кеширование было включено ранее, сбрасываем кеш
-    if [ $cache_was_enabled -eq 1 ]; then
-        log "INFO" "Был обнаружен ранее включенный DNS-кеш, сбрасываем его..."
-        print_step "Сброс DNS-кеша..."
-        
-        # Попытка сброса кеша через systemd-resolve (для старых версий)
-        if command -v systemd-resolve &> /dev/null; then
-            systemd-resolve --flush-caches &>/dev/null || true
-            log "INFO" "Выполнен сброс DNS-кеша через systemd-resolve"
-        fi
-        
-        # Попытка сброса кеша через resolvectl (для новых версий)
-        if command -v resolvectl &> /dev/null; then
-            resolvectl flush-caches &>/dev/null || true
-            log "INFO" "Выполнен сброс DNS-кеша через resolvectl"
-        fi
-        
-        print_success "Кеш DNS успешно сброшен"
-    else
-        log "INFO" "Кеширование DNS ранее не было включено, сброс кеша не требуется"
-    fi
-    
-    # Перезапуск службы DNS
-    log "INFO" "Перезапуск systemd-resolved..."
-    systemctl restart systemd-resolved || true
-    
-    # Проверка работы DNS
-    log "INFO" "Проверка работы DNS..."
-    if host google.com > /dev/null 2>&1; then
-        log "INFO" "✓ DNS работает корректно."
-        print_success "DNS настроен и работает корректно."
-        
-        # Показать итоговые настройки
-        if command -v resolvectl >/dev/null 2>&1; then
-            echo -e "\n${YELLOW}=== Новые настройки DNS ===${NC}"
-            resolvectl status | grep -E "DNS Server|DNS Domain|DNSSEC|Current DNS" | sed 's/^[[:space:]]*//'
-            
-            # Информация о кешировании
-            if [ "$cache_setting" = "yes" ]; then
-                echo -e "${GREEN}Кеширование DNS включено${NC}"
-            else
-                echo -e "${YELLOW}Кеширование DNS отключено${NC}"
-            fi
-        fi
-    else
-        log "WARNING" "⚠ Проблемы с DNS. Проверьте конфигурацию."
-        log "WARNING" "Рекомендуется перезагрузить систему после завершения скрипта."
-        print_error "Проблемы с DNS. Проверьте конфигурацию."
-        
-        # Дополнительная диагностика
-        log "INFO" "Выполнение диагностики DNS..."
-        log "INFO" "Содержимое /etc/resolv.conf:"
-        cat /etc/resolv.conf || true
-        
-        log "INFO" "Попытка ручного разрешения имен через выбранный DNS-сервер:"
-        if command -v dig &> /dev/null; then
-            dig @"$primary_ip" google.com +short || true
-        elif command -v nslookup &> /dev/null; then
-            nslookup google.com "$primary_ip" || true
-        fi
-        
-        # Сообщаем о возможных причинах проблемы
-        log "WARNING" "Возможные причины проблем с DNS:"
-        log "WARNING" "1. Блокировка DNS-трафика провайдером или файрволлом"
-        log "WARNING" "2. Проблемы с настройкой сети или маршрутизацией"
-        log "WARNING" "3. Ограничения в виртуализированной среде"
-        
-        # Предлагаем решение
-        log "INFO" "Попробуйте следующее:"
-        log "INFO" "1. Перезапустите систему"
-        log "INFO" "2. Проверьте соединение с интернетом: ping 8.8.8.8"
-        log "INFO" "3. Проверьте работу DNS вручную: nslookup google.com $primary_ip"
-        
-        # Сохраняем информацию в лог-файл
-        echo "==== Диагностика DNS $(date) ====" >> "$LOG_FILE"
-        echo "Выбранный DNS: $primary_ip" >> "$LOG_FILE"
-        echo "Содержимое /etc/resolv.conf:" >> "$LOG_FILE"
-        cat /etc/resolv.conf >> "$LOG_FILE" 2>&1 || echo "Не удалось прочитать /etc/resolv.conf" >> "$LOG_FILE"
-        echo "Результат проверки:" >> "$LOG_FILE"
-        host google.com >> "$LOG_FILE" 2>&1 || echo "Ошибка при проверке host google.com" >> "$LOG_FILE"
-        echo "=================================" >> "$LOG_FILE"
-    fi
-}
-
-# Восстановление DNS
-restore_dns() {
-    log "INFO" "Восстановление настроек DNS..."
-    print_header "Восстановление настроек DNS"
-
-    # Поиск всех резервных копий
-    local backup_dirs=()
-    local other_backups=$(find /root -maxdepth 1 -type d -name "config_backup_*" | sort -r)
-    
-    # Добавляем текущую директорию, если она содержит резервные копии
-    if [ -f "$BACKUP_DIR/resolved.conf" ] || [ -f "$BACKUP_DIR/resolv.conf" ]; then
-        backup_dirs+=("$BACKUP_DIR")
-    fi
-    
-    # Добавляем другие каталоги с резервными копиями
-    for backup_dir in $other_backups; do
-        if [ "$backup_dir" != "$BACKUP_DIR" ] && ([ -f "$backup_dir/resolved.conf" ] || [ -f "$backup_dir/resolv.conf" ]); then
-            backup_dirs+=("$backup_dir")
-        fi
-    done
-    
-    # Проверяем наличие резервных копий
-    if [ ${#backup_dirs[@]} -eq 0 ]; then
-        print_step "Резервные копии не найдены. Создание настроек DNS по умолчанию..."
-        
-        # Создание resolved.conf по умолчанию
-        cat > /etc/systemd/resolved.conf << EOF
-[Resolve]
-# DNS по умолчанию - Cloudflare DNS
-DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
-FallbackDNS=8.8.8.8#dns.google 8.8.4.4#dns.google
-Domains=~.
-DNSOverTLS=yes
-DNSSEC=yes
-
-# Кеширование DNS
-Cache=yes
-CacheFromLocalhost=yes
-DNSStubListener=yes
-EOF
-        log "INFO" "Создан файл /etc/systemd/resolved.conf с настройками по умолчанию."
-        print_success "Создан файл /etc/systemd/resolved.conf с настройками Cloudflare DNS."
-
-        # Проверяем, есть ли immutable бит
-        if command -v lsattr >/dev/null 2>&1; then
-            lsattr_output=$(lsattr /etc/resolv.conf 2>/dev/null || echo "")
-            if echo "$lsattr_output" | grep -q "i"; then
-                log "INFO" "Снятие immutable бита с /etc/resolv.conf..."
-                chattr -i /etc/resolv.conf 2>/dev/null || true
-            fi
-        fi
-        
-        # Удаление существующего файла или символической ссылки
-        if [ -L "/etc/resolv.conf" ]; then
-            rm -f "/etc/resolv.conf" 2>/dev/null || true
-            log "INFO" "Удалена символическая ссылка /etc/resolv.conf."
-        elif [ -f "/etc/resolv.conf" ]; then
-            rm -f "/etc/resolv.conf" 2>/dev/null || true
-            log "INFO" "Удален файл /etc/resolv.conf."
-        fi
-        
-        # Создание символической ссылки на systemd-resolved
-        if ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf; then
-            log "INFO" "Создана символическая ссылка на системный resolver."
-            print_success "Создана символическая ссылка на системный resolver."
-        else
-            # Если не удалось создать символическую ссылку
-            cat > /etc/resolv.conf << EOF
-# Настройки DNS по умолчанию
-# Создано: $(date "+%Y-%m-%d %H:%M:%S")
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-options edns0 trust-ad
-search .
-EOF
-            log "INFO" "Создан файл /etc/resolv.conf с настройками Cloudflare DNS."
-            print_success "Создан файл /etc/resolv.conf с настройками Cloudflare DNS."
-        fi
-        
-        # Перезапуск службы DNS
-        systemctl restart systemd-resolved || true
-        log "INFO" "Служба systemd-resolved перезапущена."
-        print_step "Служба systemd-resolved перезапущена."
-        
-        # Проверка работы DNS
-        check_dns_operation
-        return 0
-    fi
-    
-    # Если найдена только одна резервная копия
-    if [ ${#backup_dirs[@]} -eq 1 ]; then
-        local selected_backup=${backup_dirs[0]}
-        local backup_date=$(echo "$selected_backup" | grep -oE '[0-9]{8}_[0-9]{6}' || echo "Неизвестная дата")
-        local formatted_date=$(date -d "${backup_date:0:8} ${backup_date:9:2}:${backup_date:11:2}:${backup_date:13:2}" '+%d.%m.%Y %H:%M:%S' 2>/dev/null || echo "Неизвестная дата")
-        
-        print_step "Найдена одна резервная копия от $formatted_date"
-        
-        # Показываем содержимое файлов
-        show_backup_content "$selected_backup"
-        
-        # Спрашиваем пользователя о восстановлении
-        read -p "Восстановить эту резервную копию? [y/n]: " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            restore_from_backup "$selected_backup"
-        else
-            log "INFO" "Восстановление отменено пользователем."
-            print_step "Восстановление отменено."
-            return 0
-        fi
-    else
-        # Если найдено несколько резервных копий
-        print_step "Найдено ${#backup_dirs[@]} резервных копий настроек DNS"
-        
-        while true; do
-            echo -e "\n${YELLOW}=== Список доступных резервных копий ===${NC}"
-            
-            # Выводим список резервных копий с датами
-            for i in "${!backup_dirs[@]}"; do
-                local backup_dir=${backup_dirs[$i]}
-                local backup_date=$(echo "$backup_dir" | grep -oE '[0-9]{8}_[0-9]{6}' || echo "Неизвестная дата")
-                local formatted_date=$(date -d "${backup_date:0:8} ${backup_date:9:2}:${backup_date:11:2}:${backup_date:13:2}" '+%d.%m.%Y %H:%M:%S' 2>/dev/null || echo "Неизвестная дата")
-                
-                # Проверяем наличие файлов
-                local files=""
-                [ -f "$backup_dir/resolved.conf" ] && files+="resolved.conf "
-                [ -f "$backup_dir/resolv.conf" ] && files+="resolv.conf"
-                
-                echo -e "$((i+1)). ${CYAN}Копия от${NC} ${GREEN}$formatted_date${NC} ${CYAN}(файлы: $files)${NC}"
-            done
-            
-            echo -e "0. ${YELLOW}Отмена (возврат в предыдущее меню)${NC}"
-            echo
-            
-            # Запрашиваем выбор пользователя
-            read -p "Выберите резервную копию для восстановления [0-${#backup_dirs[@]}]: " choice
-            
-            # Проверяем выбор
-            if [ "$choice" = "0" ]; then
-                log "INFO" "Восстановление отменено пользователем."
-                print_step "Восстановление отменено."
-                return 0
-            elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#backup_dirs[@]} ]; then
-                local selected_backup=${backup_dirs[$((choice-1))]}
-                
-                # Показываем содержимое файлов выбранной копии
-                show_backup_content "$selected_backup"
-                
-                # Спрашиваем о подтверждении восстановления
-                read -p "Восстановить эту резервную копию? [y/n]: " confirm
-                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    restore_from_backup "$selected_backup"
-                    break
-                else
-                    log "INFO" "Выберите другую резервную копию или отмените восстановление."
-                fi
-            else
-                print_error "Некорректный выбор"
-            fi
-        done
-    fi
-}
-
-# Вспомогательная функция для показа содержимого файлов резервной копии
-show_backup_content() {
-    local backup_dir="$1"
-    
-    echo -e "\n${YELLOW}=== Содержимое резервной копии ===${NC}"
-    
-    # Показываем содержимое resolved.conf, если он существует
-    if [ -f "$backup_dir/resolved.conf" ]; then
-        echo -e "\n${CYAN}Файл${NC} ${GREEN}resolved.conf${NC}:"
-        echo -e "${BLUE}--------------------------------${NC}"
-        cat "$backup_dir/resolved.conf"
-        echo -e "${BLUE}--------------------------------${NC}"
-    else
-        echo -e "${YELLOW}Файл resolved.conf отсутствует в резервной копии.${NC}"
-    fi
-    
-    # Показываем содержимое resolv.conf, если он существует
-    if [ -f "$backup_dir/resolv.conf" ]; then
-        echo -e "\n${CYAN}Файл${NC} ${GREEN}resolv.conf${NC}:"
-        echo -e "${BLUE}--------------------------------${NC}"
-        cat "$backup_dir/resolv.conf"
-        echo -e "${BLUE}--------------------------------${NC}"
-    else
-        echo -e "${YELLOW}Файл resolv.conf отсутствует в резервной копии.${NC}"
-    fi
+    # Очищаем временные файлы
+    rm -rf "$temp_dir"
     
     echo
-}
-
-# Вспомогательная функция для восстановления из выбранной резервной копии
-restore_from_backup() {
-    local backup_dir="$1"
-    local backup_resolved=""
-    local backup_resolv=""
+    print_step "Дальнейшая настройка DNS будет выполняться через DNSCrypt-proxy."
     
-    # Проверяем наличие файлов в выбранной копии
-    [ -f "$backup_dir/resolved.conf" ] && backup_resolved="$backup_dir/resolved.conf"
-    [ -f "$backup_dir/resolv.conf" ] && backup_resolv="$backup_dir/resolv.conf"
-    
-    print_step "Восстановление из выбранной резервной копии..."
-    
-    # Восстановление resolved.conf
-    if [ -n "$backup_resolved" ]; then
-        cp "$backup_resolved" /etc/systemd/resolved.conf
-        log "INFO" "Восстановлен файл /etc/systemd/resolved.conf из резервной копии."
-        print_success "Восстановлен файл /etc/systemd/resolved.conf."
-    else
-        # Создание resolved.conf по умолчанию
-        cat > /etc/systemd/resolved.conf << EOF
-[Resolve]
-# DNS по умолчанию - Cloudflare DNS
-DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
-FallbackDNS=8.8.8.8#dns.google 8.8.4.4#dns.google
-Domains=~.
-DNSOverTLS=yes
-DNSSEC=yes
-
-# Кеширование DNS
-Cache=yes
-CacheFromLocalhost=yes
-DNSStubListener=yes
-EOF
-        log "INFO" "Создан файл /etc/systemd/resolved.conf с настройками по умолчанию."
-        print_success "Создан файл /etc/systemd/resolved.conf с настройками по умолчанию."
-    fi
-    
-    # Восстановление resolv.conf
-    if [ -n "$backup_resolv" ]; then
-        # Проверяем, есть ли immutable бит
-        if command -v lsattr >/dev/null 2>&1; then
-            lsattr_output=$(lsattr /etc/resolv.conf 2>/dev/null || echo "")
-            if echo "$lsattr_output" | grep -q "i"; then
-                log "INFO" "Снятие immutable бита с /etc/resolv.conf..."
-                chattr -i /etc/resolv.conf 2>/dev/null || true
-            fi
-        fi
-        
-        # Удаление существующего файла или символической ссылки
-        if [ -L "/etc/resolv.conf" ]; then
-            rm -f "/etc/resolv.conf" 2>/dev/null || true
-            log "INFO" "Удалена символическая ссылка /etc/resolv.conf."
-        elif [ -f "/etc/resolv.conf" ]; then
-            rm -f "/etc/resolv.conf" 2>/dev/null || true
-            log "INFO" "Удален файл /etc/resolv.conf."
-        fi
-        
-        # Копирование резервной копии
-        cp "$backup_resolv" /etc/resolv.conf
-        log "INFO" "Восстановлен файл /etc/resolv.conf из резервной копии."
-        print_success "Восстановлен файл /etc/resolv.conf."
-    else
-        # Создание символической ссылки на systemd-resolved
-        if [ ! -L "/etc/resolv.conf" ]; then
-            rm -f "/etc/resolv.conf" 2>/dev/null || true
-            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-            log "INFO" "Создана символическая ссылка на системный resolver."
-            print_success "Создана символическая ссылка на системный resolver."
-        fi
-    fi
-    
-    # Перезапуск службы DNS
-    systemctl restart systemd-resolved || true
-    log "INFO" "Служба systemd-resolved перезапущена."
-    print_step "Служба systemd-resolved перезапущена."
-    
-    # Проверка работы DNS
-    check_dns_operation
-}
-
-# Вспомогательная функция для проверки работы DNS после восстановления
-check_dns_operation() {
-    log "INFO" "Проверка работы DNS..."
-    if host google.com > /dev/null 2>&1; then
-        log "INFO" "✓ DNS работает корректно."
-        print_success "DNS работает корректно."
-    else
-        log "WARNING" "⚠ Проблемы с DNS. Рекомендуется перезагрузить систему."
-        print_error "Проблемы с DNS. Рекомендуется перезагрузить систему."
-        
-        # Дополнительная диагностика
-        log "INFO" "Выполнение диагностики DNS..."
-        log "INFO" "Содержимое /etc/resolv.conf:"
-        cat /etc/resolv.conf 2>/dev/null || log "ERROR" "Не удалось прочитать файл /etc/resolv.conf"
-        
-        if command -v resolvectl >/dev/null 2>&1; then
-            log "INFO" "Статус resolvectl:"
-            resolvectl status 2>&1 || log "ERROR" "Не удалось получить статус resolvectl"
-        fi
-        
-        log "INFO" "Попытка прямого запроса к серверам DNS:"
-        ping -c 1 1.1.1.1 >/dev/null 2>&1 && log "INFO" "Ping до 1.1.1.1 успешен." || log "WARNING" "Не удалось выполнить ping до 1.1.1.1"
-        
-        if command -v dig >/dev/null 2>&1; then
-            dig @1.1.1.1 google.com +short >/dev/null 2>&1 && log "INFO" "DNS-запрос через dig успешен." || log "WARNING" "Неудачный DNS-запрос через dig."
-        fi
-    fi
+    return 0
 }
 
 # Настройка файрволла (UFW)
@@ -1030,8 +316,29 @@ configure_firewall() {
         log "INFO" "Порт 80 (HTTP) не будет открыт"
     fi
     
+    # Настройка порта SSH
+    echo -e "\n${YELLOW}=== Настройка порта SSH ===${NC}"
+    local ssh_port=22
+    read -p "Введите порт SSH [по умолчанию 22]: " custom_ssh_port
+    
+    # Проверка введенного порта
+    if [ -n "$custom_ssh_port" ]; then
+        if [[ "$custom_ssh_port" =~ ^[0-9]+$ ]] && [ "$custom_ssh_port" -ge 1 ] && [ "$custom_ssh_port" -le 65535 ]; then
+            ssh_port=$custom_ssh_port
+            log "INFO" "Установлен кастомный порт SSH: $ssh_port"
+        else
+            log "WARNING" "Некорректный порт. Используется порт по умолчанию: 22"
+            print_error "Некорректный порт. Используется порт 22"
+            ssh_port=22
+        fi
+    else
+        log "INFO" "Используется порт SSH по умолчанию: 22"
+    fi
+    
+    echo -e "${CYAN}Порт SSH:${NC} $ssh_port"
+    
     # Настройка доступа к SSH
-    echo -e "\n${YELLOW}=== Настройка доступа к SSH ===${NC}"
+    echo -e "\n${YELLOW}=== Настройка доступа к SSH (порт $ssh_port) ===${NC}"
     read -p "Настроить SSH только для определенных IP-адресов? [y/n]: " restrict_ssh
     if [[ "$restrict_ssh" =~ ^[Yy]$ ]]; then
         log "INFO" "Настройка доступа к SSH для определенных IP-адресов"
@@ -1050,8 +357,8 @@ configure_firewall() {
             if [ -z "$ip_addr" ]; then
                 if [ ${#ssh_allowed_ips[@]} -eq 0 ]; then
                     # Список пуст, просто выходим
-                    log "INFO" "IP-адреса для SSH не указаны, порт 22 будет открыт для всех"
-                    ufw allow 22/tcp
+                    log "INFO" "IP-адреса для SSH не указаны, порт $ssh_port будет открыт для всех"
+                    ufw allow $ssh_port/tcp
                     break
                 else
                     # Список не пуст, спрашиваем о завершении
@@ -1071,16 +378,16 @@ configure_firewall() {
         
         # Применяем правила для SSH если есть IP-адреса
         if [ ${#ssh_allowed_ips[@]} -gt 0 ]; then
-            log "INFO" "Настройка правил SSH для указанных IP-адресов"
+            log "INFO" "Настройка правил SSH для указанных IP-адресов (порт $ssh_port)"
             for ip in "${ssh_allowed_ips[@]}"; do
-                ufw allow from "$ip" to any port 22 proto tcp
-                log "INFO" "Разрешен доступ к SSH для IP: $ip"
+                ufw allow from "$ip" to any port $ssh_port proto tcp
+                log "INFO" "Разрешен доступ к SSH (порт $ssh_port) для IP: $ip"
             done
         fi
     else
         # Открываем SSH для всех
-        ufw allow 22/tcp
-        log "INFO" "Порт 22 (SSH) открыт для всех"
+        ufw allow $ssh_port/tcp
+        log "INFO" "Порт $ssh_port (SSH) открыт для всех"
     fi
     
     # Настройка пользовательских портов
@@ -1535,9 +842,7 @@ show_menu() {
         # Выводим пункты меню
         echo -e "$i) ${GREEN}Установить зависимости и обновить систему${NC}"
         ((i++))
-        echo -e "$i) ${GREEN}Настроить DNS${NC}"
-        ((i++))
-        echo -e "$i) ${GREEN}Восстановить настройки DNS${NC}"
+        echo -e "$i) ${GREEN}Установить DNSCrypt-proxy${NC}"
         ((i++))
         echo -e "$i) ${GREEN}Настроить файрволл (UFW)${NC}"
         ((i++))
@@ -1568,35 +873,32 @@ show_menu() {
                 install_dependencies_and_update_system
                 ;;
             2)
-                configure_dns
+                install_dnscrypt
                 ;;
             3)
-                restore_dns
-                ;;
-            4)
                 configure_firewall
                 ;;
-            5)
+            4)
                 change_root_password
                 ;;
-            6)
+            5)
                 configure_ssh
                 ;;
+            6)
+                apply_system_tweaks
+                ;;
             7)
+                install_dependencies_and_update_system
+                install_dnscrypt
+                configure_firewall
+                change_root_password
+                configure_ssh
                 apply_system_tweaks
                 ;;
             8)
-                install_dependencies_and_update_system
-                configure_dns
-                configure_firewall
-                change_root_password
-                configure_ssh
-                apply_system_tweaks
-                ;;
-            9)
                 manage_ipv6
                 ;;
-            10)
+            9)
                 reboot_system
                 ;;
             *)
@@ -1608,7 +910,6 @@ show_menu() {
         read -p "Нажмите Enter для продолжения..."
     done
 }
-
 
 # Запуск главного меню
 show_menu
