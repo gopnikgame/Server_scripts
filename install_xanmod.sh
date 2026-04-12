@@ -1,9 +1,10 @@
+
 #!/bin/bash
 
-# Version: 1.3.0
+# Version: 1.3.1
 # Author: gopnikgame
 # Created: 2025-02-15 18:03:59 UTC
-# Last Modified: 2025-07-22 12:00:00 UTC
+# Last Modified: 2025-07-22 14:00:00 UTC
 # Description: XanMod kernel installation script with BBR3 optimization
 # Repository: https://github.com/gopnikgame/Server_scripts
 # License: MIT
@@ -11,7 +12,7 @@
 set -euo pipefail
 
 # Константы
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.3.1"
 readonly SCRIPT_AUTHOR="gopnikgame"
 readonly STATE_FILE="/var/tmp/xanmod_install_state"
 readonly LOG_FILE="/var/log/xanmod_install.log"
@@ -20,6 +21,9 @@ readonly SCRIPT_PATH="/usr/local/sbin/xanmod_install"
 readonly SERVICE_NAME="xanmod-install-continue"
 readonly CURRENT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
 readonly CURRENT_USER=$(whoami)
+
+# Адрес прокси (задаётся в configure_proxy, используется во всех сетевых операциях)
+PROXY_ADDR=""
 
 # Функция логирования
 log() {
@@ -34,6 +38,71 @@ print_header() {
 # Функция вывода ошибки
 log_error() {
     echo -e "\033[1;31m[ОШИБКА] - $1\033[0m" | tee -a "$LOG_FILE"
+}
+
+# Очистка настроек прокси (вызывается автоматически при выходе)
+cleanup_proxy() {
+    if [ -f /etc/apt/apt.conf.d/99xanmod-proxy ]; then
+        rm -f /etc/apt/apt.conf.d/99xanmod-proxy
+        log "Настройки прокси для apt удалены"
+    fi
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy 2>/dev/null || true
+}
+
+# Проверка доступности репозитория и настройка прокси при необходимости
+configure_proxy() {
+    log "Проверка доступности репозитория XanMod..."
+
+    # Быстрая проверка прямого доступа к репозиторию (таймаут 8 сек)
+    if curl -sfI --connect-timeout 8 http://deb.xanmod.org &>/dev/null; then
+        log "✓ Репозиторий deb.xanmod.org доступен напрямую"
+        return 0
+    fi
+
+    log "⚠ Репозиторий deb.xanmod.org недоступен напрямую"
+    echo -e "\n\033[1;33m=== Настройка прокси ===\033[0m"
+    echo -e "Репозиторий \033[1;36mdeb.xanmod.org\033[0m недоступен напрямую."
+    echo -e "Возможная причина: региональная блокировка (Cloudflare CDN)."
+    echo
+    echo -e "Поддерживаемые форматы HTTP-прокси:"
+    echo -e "  \033[1;36mБез авторизации:\033[0m http://host:port"
+    echo -e "  \033[1;36mС авторизацией:\033[0m  http://user:pass@host:port"
+    echo -e "  \033[1;36mHTTPS прокси:\033[0m    https://host:port"
+    echo -e "\n\033[1;33mПримечание:\033[0m SOCKS5 не поддерживается apt напрямую."
+    echo -e "Для SOCKS5 используйте локальный HTTP-to-SOCKS5 конвертер"
+    echo -e "(например: \033[1;36mssh -D 1080 user@server\033[0m + Privoxy/polipo)."
+    echo
+
+    read -rp $'\033[1;33mВведите адрес прокси (или Enter для продолжения без прокси): \033[0m' proxy_input
+
+    if [ -z "$proxy_input" ]; then
+        log "Прокси не настроен. Продолжение без прокси."
+        return 0
+    fi
+
+    PROXY_ADDR="$proxy_input"
+
+    # Применяем переменные окружения (используются wget, curl, и другими утилитами)
+    export http_proxy="$PROXY_ADDR"
+    export https_proxy="$PROXY_ADDR"
+    export HTTP_PROXY="$PROXY_ADDR"
+    export HTTPS_PROXY="$PROXY_ADDR"
+    export no_proxy="localhost,127.0.0.1,::1"
+
+    # Настраиваем прокси для apt (файл будет удалён cleanup_proxy при выходе)
+    cat > /etc/apt/apt.conf.d/99xanmod-proxy << PROXYEOF
+Acquire::http::Proxy "$PROXY_ADDR";
+Acquire::https::Proxy "$PROXY_ADDR";
+PROXYEOF
+
+    log "✓ Прокси настроен: $PROXY_ADDR"
+
+    # Проверяем доступность репозитория через прокси
+    if curl -sfI --proxy "$PROXY_ADDR" --connect-timeout 10 http://deb.xanmod.org &>/dev/null; then
+        log "✓ Репозиторий доступен через прокси"
+    else
+        log "⚠ Репозиторий недоступен и через прокси. Установка продолжится, возможны ошибки."
+    fi
 }
 
 # Проверка прав root
@@ -736,6 +805,9 @@ remove_startup_service() {
 
 # Главная функция
 main() {
+    # Гарантируем очистку настроек прокси при любом выходе из скрипта
+    trap cleanup_proxy EXIT
+
     if [[ "${1:-}" == "--continue" ]] && [ -f "$STATE_FILE" ]; then
         configure_bbr
         remove_startup_service
@@ -752,6 +824,7 @@ main() {
     check_os
     check_internet
     check_disk_space
+    configure_proxy
     install_kernel
     create_startup_service
     echo -e "\n\033[1;33mУстановка завершена. Система будет перезагружена через 5 секунд...\033[0m"

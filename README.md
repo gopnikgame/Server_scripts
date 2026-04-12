@@ -1,126 +1,301 @@
-# 🚀 Server Scripts Manager v1.0.18
+# 🚀 Server Scripts Manager
 
-![Version](https://img.shields.io/badge/version-1.0.18-blue)
-![Updated](https://img.shields.io/badge/updated-2025--11--17-green)
+![Launcher](https://img.shields.io/badge/launcher-v1.0.7-blue)
+![Proxy](https://img.shields.io/badge/proxy--manager-v1.2.0-blueviolet)
+![Updated](https://img.shields.io/badge/updated-2025--07--22-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
+![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04-orange)
 
-Автоматизированный комплекс скриптов для настройки и оптимизации Ubuntu 24.04 серверов.
+Модульный комплекс bash-скриптов для первоначальной настройки и оптимизации Ubuntu 24.04 серверов.  
+Все модули загружаются автоматически с GitHub и запускаются через единое интерактивное меню.
 
-## ⚡ Быстрая установка
+## ⚡ Быстрый старт
 
 ```bash
-wget -qO server_launcher.sh https://raw.githubusercontent.com/gopnikgame/Server_scripts/main/server_launcher.sh && chmod +x server_launcher.sh && sudo ./server_launcher.sh
+wget -qO server_launcher.sh https://raw.githubusercontent.com/gopnikgame/Server_scripts/main/server_launcher.sh \
+  && chmod +x server_launcher.sh && sudo ./server_launcher.sh
 ```
+
+> **Заблокирован GitHub?** — сначала настройте прокси вручную, см. раздел [«Что делать, если что-то не устанавливается»](#-что-делать-если-что-то-не-устанавливается).
+
+---
 
 ## 📦 Модули
 
-### Server Launcher
-Центральный менеджер для управления всеми модулями системы.
+| # | Модуль | Назначение |
+|---|--------|-----------|
+| 1 | `ubuntu_pre_install.sh` | Первоначальная настройка Ubuntu 24.04 |
+| 2 | `setup_proxy.sh` | Настройка прокси (HTTP / SSH+Privoxy / VPN / VLESS) |
+| 3 | `install_xanmod.sh` | Установка XanMod Kernel с BBR3 |
+| 4 | `bbr_info.sh` | Проверка и настройка конфигурации BBR |
+| 5 | `snapfile.sh` | Управление файлом подкачки (Swap) |
+| 6 | `speed_dns.sh` | Тестирование DNS-серверов |
+| 7 | `auto_update_vps.sh` | Автоматическое обновление VPS |
 
-### Ubuntu Pre-Install
-Первоначальная настройка системы:
+---
+
+### 1 · Ubuntu Pre-Install
+
+Первоначальная настройка сервера «с нуля»:
+
 - Установка базовых пакетов
-- Настройка DNS (DoH/DoT, DNSSEC)
-- Конфигурация UFW
-- Безопасность SSH
+- **DNS**: DNSCrypt-proxy (DoH/DoT + DNSSEC)
+- **UFW**: SSH-порт на выбор (22 или кастомный), 80, 443
+- **SSH**: только ключевая аутентификация, таймаут 30 с, максимум 3 попытки
 - Управление IPv6
 
-### XanMod Kernel
+---
+
+### 2 · Proxy Manager
+
+Настройка системного прокси для всех операций (`apt`, `curl`, `wget` и т.д.).  
+Прокси прописывается в `/etc/environment`, `/etc/profile.d/proxy.sh` и `/etc/apt/apt.conf.d/99proxy`.
+
+**Режимы:**
+
+| Пункт меню | Режим | Схема |
+|-----------|-------|-------|
+| 1 | HTTP прокси | Прямое подключение к HTTP/HTTPS прокси |
+| 2 | SSH + Privoxy | `ssh -D` (SOCKS5) → Privoxy → HTTP системный прокси |
+| 3 | VPN системный прокси | HTTP прокси от работающего VPN-клиента (Clash, Mihomo...) |
+| 4 | **Xray VLESS** | Вставить `vless://...` → Xray-core локально → HTTP `:10809` |
+| 5 | **Диагностика** | Проверяет блокировки и рекомендует нужный режим |
+| 6 | Обновить статус | Перечитать статус сервисов |
+| 7 | Отключить прокси | Удалить все настройки, остановить сервисы |
+
+**VLESS поддерживает:** REALITY+TCP, TLS+TCP/WS/gRPC, автоустановку `xray-core`.
+
+---
+
+### 3 · XanMod Kernel
+
 Оптимизированное ядро с BBR3:
+
 - Версии: 6.14, 6.15
-- Планировщик fq_pie
-- Оптимизация для 10Gbit+
-- ECN и TCP оптимизации
+- Планировщик: `fq_pie`
+- ECN и TCP-оптимизации для 10 Gbit+
+- Поддержка HTTP-прокси (обход блокировки `deb.xanmod.org`)
 
-### BBR Monitor
-Мониторинг и диагностика BBR3.
+---
 
-### Swap Manager
-Управление файлом подкачки:
-- Автоматический расчет размера
-- Создание/удаление swap
+### 4 · BBR Monitor
 
-### DNS Speed Test
-Тестирование DNS-серверов:
-- Измерение скорости
-- Проверка утечек
+Диагностика и настройка BBR/BBR3:
+
+- Текущий алгоритм управления перегрузкой
+- Версия ядра и загруженные модули
+- Применение параметров `sysctl`
+
+---
+
+### 5 · Swap Manager
+
+- Автоматический расчёт размера
+- Создание / удаление swap
+- Настройка `vm.swappiness`
+
+---
+
+### 6 · DNS Speed Test
+
+- Сравнительный замер задержки резолверов
+- Проверка DNS-утечек
 - Трассировка маршрутов
 
-### Auto Update VPS
-Автоматическое обновление системы:
-- Гибкое расписание (еженедельно/ежемесячно)
+---
+
+### 7 · Auto Update VPS
+
+- Расписание: еженедельно / ежемесячно
 - Автоперезагрузка (опционально)
+- Защита конфигурационных файлов
 - Детальное логирование
-- Защита конфигураций
+
+---
+
+## 🔥 Что делать, если что-то не устанавливается
+
+Некоторые ресурсы (GitHub, `deb.xanmod.org`, Docker Hub) могут быть заблокированы.  
+Запустите **встроенный диагностический мастер**: `setup_proxy.sh` → пункт **5 · Диагностика**.
+
+### Логический маршрут
+
+```
+sudo ./server_launcher.sh
+         │
+         ▼
+   Пункт 2 → setup_proxy.sh
+         │
+         ▼
+   5) Диагностика
+         │
+         ├─ Нет интернета вообще? ──► ip route / ping 8.8.8.8 / resolvectl status
+         │
+         ├─ Всё доступно? ──────────► Прокси не нужен → см. "Типичные ошибки" ниже
+         │
+         └─ Ресурсы заблокированы?
+                    │
+                    ├─ Есть VLESS ссылка? ─────────► 4) Xray VLESS
+                    │                                   вставить vless://... → готово
+                    │
+                    ├─ Есть SSH-сервер за рубежом? ─► 2) SSH + Privoxy
+                    │                                   ssh-copy-id → ввести host/user
+                    │
+                    ├─ Работает VPN с HTTP прокси? ─► 3) VPN системный прокси
+                    │                                   указать адрес (:7890, :10809...)
+                    │
+                    ├─ Есть HTTP прокси? ──────────► 1) HTTP прокси
+                    │                                   указать адрес:порт
+                    │
+                    └─ Ничего нет?
+                               │
+                               ├─ Cloudflare WARP (бесплатно):
+                               │    curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
+                               │    warp-cli registration new
+                               │    warp-cli mode proxy && warp-cli connect
+                               │    → прокси: http://127.0.0.1:40001
+                               │    → затем пункт 3) VPN системный прокси
+                               │
+                               └─ Арендовать VPS (€3–5/мес):
+                                    DigitalOcean / Hetzner / Vultr / BuyVM
+                                    → поднять Xray-server → получить VLESS ссылку
+                                    → пункт 4) Xray VLESS
+```
+
+### Применение прокси к текущей SSH-сессии
+
+```bash
+source /etc/profile.d/proxy.sh
+```
+
+### Отключение прокси после установки
+
+```bash
+# Через меню: пункт 7) Отключить прокси
+
+# Для текущей сессии вручную:
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
+```
+
+### Типичные ошибки (не блокировки)
+
+| Симптом | Команда |
+|---------|---------|
+| `E: Unable to fetch` | `apt-get clean && apt-get update` |
+| `No space left on device` | `df -h` |
+| `GPG error` | `ls /etc/apt/trusted.gpg.d/` |
+| Неверный sources.list | `cat /etc/apt/sources.list.d/*.list` |
+
+---
+
+## 🗂️ Структура файловой системы
+
+```
+/root/server-scripts/                         # Launcher
+/usr/local/server-scripts/modules/            # Загруженные модули
+/usr/local/etc/xray/config.json               # Конфигурация Xray
+/etc/server-scripts/proxy.conf                # Состояние прокси
+/etc/profile.d/proxy.sh                       # Экспорт переменных прокси
+/etc/apt/apt.conf.d/99proxy                   # APT прокси
+/etc/systemd/system/ssh-tunnel-proxy.service  # SSH туннель (если настроен)
+/var/log/server-scripts/                      # Логи launcher и модулей
+/var/log/xray/                                # Логи Xray
+/etc/auto_update_vps.conf                     # Конфигурация автообновления
+```
+
+---
 
 ## 📋 Требования
 
 - Ubuntu 24.04 LTS
-- 5GB свободного места
 - Root-доступ
-- Интернет
+- Минимум 5 ГБ свободного места
+- Интернет (или настроенный прокси)
 
-## 🔧 Структура
-
-```
-/root/server-scripts/           # Основная директория
-/usr/local/server-scripts/      # Модули
-/var/log/server-scripts/ # Логи
-/etc/auto_update_vps.conf   # Конфигурация автообновления
-```
+---
 
 ## 🛡️ Безопасность
 
 **SSH:**
-- Только ключевая аутентификация
-- Таймаут: 30 сек
-- Максимум попыток: 3
+- Только ключевая аутентификация (`PasswordAuthentication no`)
+- `LoginGraceTime 30`, `MaxAuthTries 3`
+- Кастомный порт (задаётся при установке)
 
 **UFW:**
-- Порты: 22, 80, 443
-- Deny incoming / Allow outgoing
-- Блокировка нежелательных AS
+- `Deny incoming` / `Allow outgoing` по умолчанию
+- Открыты: выбранный SSH-порт, 80, 443
 
 **DNS:**
-- DoH/DoT поддержка
-- DNSSEC включен
-- Кеширование
+- DNSCrypt-proxy: DoH + DoT + DNSSEC
+- Кеширование, защита от DNS-утечек
+
+**Прокси:**
+- Все настройки изолированы, полностью удаляются через пункт «Отключить прокси»
+- Оригинальный конфиг Privoxy сохраняется в `/etc/privoxy/config.orig`
+
+---
 
 ## 📝 Логи
 
 ```bash
-# Системные логи
+# Launcher
 tail -f /var/log/server-scripts/server-scripts.log
 
-# Логи автообновления
+# Proxy Manager
+tail -f /var/log/server-scripts/setup_proxy.log
+
+# Xray
+tail -f /var/log/xray/error.log
+journalctl -u xray -f
+
+# SSH туннель
+journalctl -u ssh-tunnel-proxy.service -f
+
+# Автообновление
 tail -f /var/log/auto_update_vps.log
 ```
+
+---
+
+## 🔄 Обновление
+
+```bash
+sudo server_launcher.sh
+# → «Обновить все модули»  — перезагрузить модули с GitHub
+# → «Обновить launcher»    — обновить сам менеджер
+```
+
+---
 
 ## 🆘 Диагностика
 
 ```bash
-# SSH
-ssh -T -v root@server
+# Сеть
+ip route
+ping 8.8.8.8
 
 # DNS
 resolvectl status
 
 # BBR
 sysctl net.ipv4.tcp_congestion_control
+sysctl net.core.default_qdisc
+
+# Xray — тест конфига
+xray -test -config /usr/local/etc/xray/config.json
+
+# SSH туннель
+journalctl -u ssh-tunnel-proxy.service -n 30
 
 # Автообновление
 cat /etc/auto_update_vps.conf
 ```
 
-## 🔄 Обновление
-
-1. Запустите launcher
-2. Выберите "Обновить все модули"
-3. Перезагрузите при необходимости
+---
 
 ## 📜 Лицензия
 
-MIT License © 2025 gopnikgame
+MIT License © 2025 [gopnikgame](https://github.com/gopnikgame)
 
 ## 🤝 Поддержка
 
@@ -128,4 +303,4 @@ MIT License © 2025 gopnikgame
 
 ---
 
-**Версия:** 1.0.18 | **Дата:** 2025-11-17 | **Автор:** gopnikgame
+**Launcher:** v1.0.7 · **Proxy Manager:** v1.2.0 · **Дата:** 2025-07-22 · **Автор:** gopnikgame
