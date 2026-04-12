@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Version: 1.2.2
+# Version: 1.3.0
 # Author: gopnikgame
 # Created: 2025-02-15 18:03:59 UTC
-# Last Modified: 2025-07-22 10:00:00 UTC
+# Last Modified: 2025-07-22 12:00:00 UTC
 # Description: XanMod kernel installation script with BBR3 optimization
 # Repository: https://github.com/gopnikgame/Server_scripts
 # License: MIT
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # Константы
-readonly SCRIPT_VERSION="1.2.2"
+readonly SCRIPT_VERSION="1.3.0"
 readonly SCRIPT_AUTHOR="gopnikgame"
 readonly STATE_FILE="/var/tmp/xanmod_install_state"
 readonly LOG_FILE="/var/log/xanmod_install.log"
@@ -145,21 +145,26 @@ check_disk_space() {
 }
 
 # Определение PSABI версии
+# Логика основана на официальном скрипте: https://dl.xanmod.org/check_x86-64_psabi.sh
 get_psabi_version() {
     local level=1
     local flags
-    flags=$(grep -m1 flags /proc/cpuinfo | cut -d ':' -f 2 | tr -d ' \n\t\r')
-    
-    if [[ $flags =~ avx512 ]]; then 
-        # Для AVX-512 используем v3, так как метапакета x64v4 нет в репозитории
-        level=3
-        log "Обнаружена поддержка AVX-512, используется оптимизация x64v3 (максимальная поддерживаемая)"
-    elif [[ $flags =~ avx2 ]]; then 
-        level=3
-    elif [[ $flags =~ sse4_2 ]]; then 
+    flags=$(grep -m1 flags /proc/cpuinfo | cut -d ':' -f 2)
+
+    _has_flag() {
+        echo "$flags" | grep -qw "$1"
+    }
+
+    # x86-64-v2: SSE4.2, SSSE3, POPCNT, CMPXCHG16B
+    if _has_flag sse4_2 && _has_flag ssse3 && _has_flag popcnt && _has_flag cx16; then
         level=2
     fi
-    
+
+    # x86-64-v3: AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE
+    if [ $level -eq 2 ] && _has_flag avx2 && _has_flag bmi1 && _has_flag bmi2 && _has_flag f16c && _has_flag fma && _has_flag lzcnt && _has_flag movbe; then
+        level=3
+    fi
+
     printf 'x64v%d' "$level"
 }
 
@@ -273,11 +278,15 @@ select_kernel_version() {
         
         echo -e "\n\033[1;33m📦 Доступные версии ядра:\033[0m"
         echo "----------------------------------------"
-        echo -e "\033[1;36m1)\033[0m linux-xanmod         \033[1;32m(Рекомендуется, 6.15)\033[0m"
-        echo -e "\033[1;36m2)\033[0m linux-xanmod-edge    \033[1;33m(Тестовая, 6.15)\033[0m"
-        echo -e "\033[1;36m3)\033[0m linux-xanmod-rt      \033[1;35m(RT, 6.12)\033[0m"
-        echo -e "\033[1;36m4)\033[0m linux-xanmod-lts     \033[1;34m(LTS, 6.12)\033[0m"
+        echo -e "\033[1;36m1)\033[0m linux-xanmod         \033[1;32m(Рекомендуется, MAIN)\033[0m"
+        echo -e "\033[1;36m2)\033[0m linux-xanmod-edge    \033[1;33m(Тестовая, EDGE)\033[0m"
+        echo -e "\033[1;36m3)\033[0m linux-xanmod-rt      \033[1;35m(Real-time, RT)\033[0m"
+        echo -e "\033[1;36m4)\033[0m linux-xanmod-lts     \033[1;34m(Долгосрочная поддержка, LTS)\033[0m"
         echo "----------------------------------------"
+
+        if [[ "${PSABI_VERSION}" == "x64v1" ]]; then
+            echo -e "\033[1;31m⚠ Ваш CPU поддерживает только x64v1. Доступна только LTS версия.\033[0m"
+        fi
     } > /dev/tty
 
     read -rp $'\033[1;33mВыберите версию ядра (1-4, по умолчанию 1): \033[0m' choice < /dev/tty
@@ -290,9 +299,15 @@ select_kernel_version() {
         *) KERNEL_PACKAGE="linux-xanmod";;
     esac
 
-    if [[ $KERNEL_PACKAGE != "linux-xanmod-rt" ]]; then
-        KERNEL_PACKAGE="${KERNEL_PACKAGE}-${PSABI_VERSION}"
+    # x64v1 доступен только для LTS; для MAIN/EDGE/RT минимум x64v2
+    local psabi_for_package="${PSABI_VERSION}"
+    if [[ "${psabi_for_package}" == "x64v1" && "$KERNEL_PACKAGE" != "linux-xanmod-lts" ]]; then
+        log "⚠ x64v1 доступен только для LTS. Переключение на LTS."
+        echo -e "\033[1;31m⚠ x64v1 доступен только для LTS ядра. Автоматический выбор LTS.\033[0m" > /dev/tty
+        KERNEL_PACKAGE="linux-xanmod-lts"
     fi
+
+    KERNEL_PACKAGE="${KERNEL_PACKAGE}-${psabi_for_package}"
 
     printf "%s" "$KERNEL_PACKAGE"
 }
@@ -444,6 +459,16 @@ install_kernel() {
     echo -e "\n\033[1;33mУстановка пакета: ${KERNEL_PACKAGE}\033[0m"
     apt-get update -qq
 
+    # Определение типа загрузчика (BIOS / UEFI)
+    local grub_package=""
+    if [ -d /sys/firmware/efi ]; then
+        grub_package="grub-efi-amd64"
+        log "Обнаружена загрузка UEFI, будет использован $grub_package"
+    else
+        grub_package="grub-pc"
+        log "Обнаружена загрузка BIOS, будет использован $grub_package"
+    fi
+
     # Настройка параметров загрузки для BBR3
     log "Настройка параметров загрузки ядра..."
     if ! grep -q "tcp_congestion_control=bbr" /etc/default/grub; then
@@ -454,12 +479,12 @@ install_kernel() {
 
     # Установка с явным указанием конфигурации GRUB
     export DEBIAN_FRONTEND=noninteractive
-    
+
     # Определяем тип пакета и устанавливаем соответствующие пакеты
     if [[ "$KERNEL_PACKAGE" =~ ^linux-xanmod ]]; then
         # Установка метапакета
         log "Установка метапакета XanMod: $KERNEL_PACKAGE"
-        if ! apt-get install -y "$KERNEL_PACKAGE" grub-pc; then
+        if ! apt-get install -y "$KERNEL_PACKAGE" "$grub_package"; then
             log_error "Ошибка при установке метапакета. Попытка установки конкретных пакетов..."
             
             # Если метапакет не устанавливается, попробуем найти конкретную версию ядра
@@ -493,7 +518,7 @@ install_kernel() {
                 local headers_package="${image_package/image/headers}"
                 log "Установка образа ядра: $image_package и заголовков: $headers_package"
                 
-                if ! apt-get install -y "$image_package" "$headers_package" grub-pc; then
+                if ! apt-get install -y "$image_package" "$headers_package" "$grub_package"; then
                     log_error "Ошибка при установке ядра"
                     exit 1
                 fi
@@ -506,16 +531,16 @@ install_kernel() {
         # Установка конкретного образа ядра
         log "Установка конкретного образа ядра: $KERNEL_PACKAGE"
         local headers_package="${KERNEL_PACKAGE/linux-image/linux-headers}"
-        
+
         if apt-cache show "$headers_package" >/dev/null 2>&1; then
             log "Установка ядра и заголовков: $KERNEL_PACKAGE, $headers_package"
-            if ! apt-get install -y "$KERNEL_PACKAGE" "$headers_package" grub-pc; then
+            if ! apt-get install -y "$KERNEL_PACKAGE" "$headers_package" "$grub_package"; then
                 log_error "Ошибка при установке ядра"
                 exit 1
             fi
         else
             log "Заголовки не найдены, установка только образа ядра: $KERNEL_PACKAGE"
-            if ! apt-get install -y "$KERNEL_PACKAGE" grub-pc; then
+            if ! apt-get install -y "$KERNEL_PACKAGE" "$grub_package"; then
                 log_error "Ошибка при установке ядра"
                 exit 1
             fi
@@ -559,7 +584,6 @@ net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_ecn=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_sack=1
-net.ipv4.tcp_low_latency=1
 
 # Buffer settings optimized for 10Gbit+ networks
 net.core.rmem_max=67108864
@@ -593,7 +617,7 @@ net.core.busy_poll=50
 net.ipv4.tcp_max_orphans=16384
 EOF
 
-    if ! sysctl -p "$temp_config" &>"$LOG_FILE"; then
+    if ! sysctl -p "$temp_config" &>>"$LOG_FILE"; then
         log_error "Ошибка применения настроек sysctl. Подробности:"
         cat "$LOG_FILE"
         rm -f "$temp_config"
@@ -609,22 +633,31 @@ EOF
     rm -f "$temp_config"
     log "✓ Сетевые настройки применены"
 
-    # Проверка загрузки модуля BBR
-    if ! lsmod | grep -q "^tcp_bbr "; then
-        log "Загрузка модуля tcp_bbr..."
-        modprobe tcp_bbr
-        if [ $? -ne 0 ]; then
-            log_error "Ошибка загрузки модуля tcp_bbr"
-            exit 1
-        fi
+    # Проверка BBR (в XanMod tcp_bbr встроен в ядро [built-in], не модуль)
+    if lsmod | grep -q "^tcp_bbr "; then
+        log "✓ BBR загружен как модуль"
+    elif sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
+        log "✓ BBR встроен в ядро (built-in)"
+    else
+        log "Попытка загрузки модуля tcp_bbr..."
+        modprobe tcp_bbr 2>/dev/null || true
     fi
 
     # Проверка версии BBR
-    bbr_version=$(modinfo tcp_bbr | grep "^version:" | awk '{print $2}')
-    if [[ "$bbr_version" == "3" ]]; then
-        log "✓ Обнаружен BBR3 (версия модуля: $bbr_version)"
+    local bbr_version="unknown"
+    if modinfo tcp_bbr &>/dev/null; then
+        bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep "^version:" | awk '{print $2}')
+    elif [ -f /sys/module/tcp_bbr/version ]; then
+        bbr_version=$(cat /sys/module/tcp_bbr/version)
+    fi
+
+    # Проверяем доступность bbr в списке алгоритмов
+    local available_cc
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    if echo "$available_cc" | grep -qw "bbr"; then
+        log "✓ BBR доступен в списке алгоритмов: $available_cc"
     else
-        log_error "Неожиданная версия BBR: $bbr_version (ожидается 3)"
+        log_error "BBR не найден в доступных алгоритмах: $available_cc"
     fi
     
     echo -e "\n\033[1;33mВажно: BBR3 будет активирован после перезагрузки\033[0m"
@@ -640,7 +673,13 @@ check_bbr_version() {
     local current_qdisc
     current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
     local bbr_version
-    bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep "^version:" | awk '{print $2}' || echo "unknown")
+    if modinfo tcp_bbr &>/dev/null; then
+        bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep "^version:" | awk '{print $2}' || echo "unknown")
+    elif [ -f /sys/module/tcp_bbr/version ]; then
+        bbr_version=$(cat /sys/module/tcp_bbr/version)
+    else
+        bbr_version="built-in"
+    fi
     
     echo -e "\n\033[1;33mТекущая конфигурация:\033[0m"
     echo "----------------------------------------"
@@ -650,14 +689,13 @@ check_bbr_version() {
     echo -e "ECN статус:             \033[1;32m$(sysctl -n net.ipv4.tcp_ecn)\033[0m"
     echo "----------------------------------------"
 
-    if [[ "$current_cc" == "bbr" && "$bbr_version" == "3" && "$current_qdisc" == "fq_pie" ]]; then
-        echo -e "\n\033[1;32m✓ BBR3 правильно настроен и активен\033[0m"
+    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_pie" ]]; then
+        echo -e "\n\033[1;32m✓ BBR правильно настроен и активен\033[0m"
     else
-        echo -e "\n\033[1;31m⚠ BBR3 настроен некорректно\033[0m"
+        echo -e "\n\033[1;31m⚠ BBR настроен некорректно\033[0m"
         echo -e "\nОжидаемые значения:"
-        echo -e "- tcp_congestion_control: bbr"
-        echo -e "- BBR версия: 3"
-        echo -e "- default_qdisc: fq_pie"
+        echo -e "- tcp_congestion_control: bbr (текущее: $current_cc)"
+        echo -e "- default_qdisc: fq_pie (текущее: $current_qdisc)"
     fi
 }
 
