@@ -113,7 +113,7 @@ install_dependencies_and_update_system() {
     
     # Список необходимых пакетов
     local required_packages=(
-        curl wget git htop neofetch mc
+        curl wget git htop fastfetch mc
         net-tools nmap tcpdump iotop
         unzip tar vim tmux screen
         rsync ncdu dnsutils
