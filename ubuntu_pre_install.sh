@@ -111,15 +111,36 @@ install_dependencies_and_update_system() {
     log "INFO" "Установка зависимостей и обновление системы..."
     print_header "Установка зависимых пакетов и обновление системы"
     
-    # Список необходимых пакетов
-    local required_packages=(
-        curl wget git htop fastfetch mc
+    # Базовый список пакетов (без neofetch/fastfetch)
+    local base_packages=(
+        curl wget git mc
         net-tools nmap tcpdump iotop
         unzip tar vim tmux screen
         rsync ncdu dnsutils
         whois ufw openssh-server
-        mtr
+        mtr htop
     )
+    
+    # Определяем, какой пакет для информации о системе доступен
+    local system_info_package=""
+    
+    # Проверяем, доступен ли fastfetch в репозиториях
+    if apt-cache show fastfetch &>/dev/null; then
+        system_info_package="fastfetch"
+        log "INFO" "Найден пакет fastfetch в репозиториях"
+    # Если fastfetch нет, проверяем neofetch
+    elif apt-cache show neofetch &>/dev/null; then
+        system_info_package="neofetch"
+        log "INFO" "Найден пакет neofetch в репозиториях"
+    else
+        log "WARNING" "Ни fastfetch, ни neofetch не доступны для установки. Пропускаем."
+    fi
+    
+    # Формируем финальный список пакетов
+    local required_packages=("${base_packages[@]}")
+    if [ -n "$system_info_package" ]; then
+        required_packages+=("$system_info_package")
+    fi
     
     # Обновление списка пакетов
     print_step "Обновление списков пакетов..."
@@ -188,10 +209,17 @@ install_dependencies_and_update_system() {
         fi
     done
     
+    # Проверяем установленный пакет для информации о системе
+    if [ -n "$system_info_package" ]; then
+        if command -v "$system_info_package" &> /dev/null; then
+            local info_version=$($system_info_package --version 2>&1 | head -n 1)
+            echo -e "${GREEN}✓${NC} $system_info_package: $info_version"
+        fi
+    fi
+    
     echo 
     return 0
 }
-
 # Установка DNSCrypt через внешний скрипт
 install_dnscrypt() {
     log "INFO" "Установка DNSCrypt-proxy..."
