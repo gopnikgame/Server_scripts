@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Version: 2.0.0
+# Version: 2.0.1
 # Description: Interactive XanMod installer for VLESS TCP servers
 # Repository: https://github.com/gopnikgame/Server_scripts
 # License: MIT
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly LOG_FILE="${XANMOD_LOG_FILE:-/var/log/xanmod_install.log}"
 readonly STATE_FILE="${XANMOD_STATE_FILE:-/var/lib/server-scripts/xanmod.state}"
 readonly SYSCTL_CONFIG="${XANMOD_SYSCTL_CONFIG:-/etc/sysctl.d/99-xanmod-vless-tcp.conf}"
@@ -34,6 +34,20 @@ BOOT_FREE_MB=0
 BOOTLOADER="unknown"
 SECURE_BOOT="unknown"
 DKMS_STATUS="not-installed"
+
+profile_keys() {
+    printf '%s\n' \
+        net.core.default_qdisc \
+        net.ipv4.tcp_congestion_control \
+        net.ipv4.tcp_mtu_probing \
+        net.ipv4.tcp_syncookies \
+        net.core.somaxconn \
+        net.ipv4.tcp_max_syn_backlog \
+        net.core.rmem_max \
+        net.core.wmem_max \
+        net.ipv4.tcp_rmem \
+        net.ipv4.tcp_wmem
+}
 
 init_runtime() {
     umask 077
@@ -193,8 +207,11 @@ cleanup_proxy() {
 }
 
 repo_reachable() {
-    curl -fsSI --connect-timeout 8 "$XANMOD_KEY_URL" >/dev/null 2>&1 &&
-        curl -fsSI --connect-timeout 8 "$XANMOD_REPO_URL" >/dev/null 2>&1
+    # The repository root currently answers HTTP 404 while valid APT paths work.
+    # Any completed HTTP response proves transport reachability; only connection
+    # failures/timeouts should trigger proxy setup.
+    curl -sSI --connect-timeout 8 "$XANMOD_KEY_URL" >/dev/null 2>&1 &&
+        curl -sSI --connect-timeout 8 "$XANMOD_REPO_URL" >/dev/null 2>&1
 }
 
 configure_proxy_interactive() {
@@ -231,6 +248,19 @@ backup_file() {
     mkdir -p "$BACKUP_DIR"
     target="$BACKUP_DIR/${label}.${stamp}"
     cp -a "$source" "$target"
+    printf '%s\n' "$target"
+}
+
+backup_runtime_profile() {
+    local stamp target key value
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    mkdir -p "$BACKUP_DIR"
+    target="$BACKUP_DIR/runtime.$stamp"
+    while IFS= read -r key; do
+        value=$(sysctl -n "$key" 2>/dev/null) || continue
+        printf '%s=%s\n' "$key" "$value" >> "$target"
+    done < <(profile_keys)
+    chmod 600 "$target"
     printf '%s\n' "$target"
 }
 
@@ -381,7 +411,7 @@ apply_vless_profile() {
     collect_system_info || return 1
     [[ "$(uname -r)" == *xanmod* ]] || { error "Сначала загрузите установленное ядро XanMod"; return 1; }
     sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr || { error "Загруженное ядро не предоставляет BBR"; return 1; }
-    local temporary backup=""
+    local temporary backup="" runtime_backup
     temporary=$(mktemp)
     render_vless_profile "$RAM_MB" > "$temporary"
     validate_profile_keys "$temporary" || { rm -f "$temporary"; return 1; }
@@ -389,6 +419,8 @@ apply_vless_profile() {
     cat "$temporary"
     printf '\nПрофиль не меняет keepalive, TIME_WAIT, FIN timeout, ECN, busy_poll или глобальные default-буферы.\n'
     confirm "Применить этот профиль?" || { rm -f "$temporary"; return 0; }
+    runtime_backup=$(backup_runtime_profile)
+    log "Снимок прежних runtime sysctl: $runtime_backup"
     [[ ! -e "$SYSCTL_CONFIG" ]] || backup=$(backup_file "$SYSCTL_CONFIG" sysctl)
     install -m 0644 "$temporary" "$SYSCTL_CONFIG"
     rm -f "$temporary"
@@ -403,22 +435,29 @@ apply_vless_profile() {
 
 verify_configuration() {
     header "Проверка XanMod и VLESS TCP"
-    local kernel cc qdisc available profile="нет"
+    local kernel cc qdisc available profile="нет" xray_status live_qdisc
     kernel=$(uname -r)
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
     available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)
+    xray_status=$(systemctl is-active xray 2>/dev/null || true)
+    [[ -n "$xray_status" ]] || xray_status="не-найден"
+    live_qdisc=$(tc qdisc show 2>/dev/null | awk '$2 != "noqueue" {print $2; exit}')
+    [[ -n "$live_qdisc" ]] || live_qdisc="unknown"
     [[ -f "$SYSCTL_CONFIG" ]] && profile="да"
     printf 'Ядро:                %s\n' "$kernel"
     printf 'Доступные CC:         %s\n' "$available"
     printf 'Активный CC:          %s\n' "$cc"
     printf 'Qdisc по умолчанию:   %s\n' "$qdisc"
     printf 'Профиль установлен:   %s\n' "$profile"
-    printf 'Xray:                 %s\n' "$(systemctl is-active xray 2>/dev/null || echo не-найден)"
+    printf 'Qdisc интерфейса:     %s\n' "$live_qdisc"
+    printf 'Xray:                 %s\n' "$xray_status"
     printf 'Failed services:      %s\n' "$(systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d ' ')"
     printf 'Socket summary:\n'; ss -s 2>/dev/null || true
-    if [[ "$kernel" == *xanmod* && "$cc" == bbr && "$qdisc" == fq ]]; then
-        success "XanMod + BBR + fq активны"
+    if [[ "$kernel" == *xanmod* && "$cc" == bbr && "$qdisc" == fq && "$live_qdisc" == fq ]]; then
+        success "XanMod + BBR + fq активны, включая очередь интерфейса"
+    elif [[ "$kernel" == *xanmod* && "$cc" == bbr && "$qdisc" == fq ]]; then
+        warn "Параметры активны, но существующий интерфейс ещё использует '$live_qdisc'; после перезагрузки ожидается fq"
     else
         warn "Конфигурация ещё не соответствует профилю VLESS TCP Stable"
     fi
@@ -428,7 +467,7 @@ rollback_profile() {
     require_root || return 1
     header "Откат сетевого профиля"
     [[ -f "$SYSCTL_CONFIG" ]] || { warn "Активный профиль не найден"; return 0; }
-    local backups selected
+    local backups selected runtime_backup
     backups=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'sysctl.*' 2>/dev/null | sort -r || true)
     if [[ -n "$backups" ]]; then
         selected=$(head -n1 <<<"$backups")
@@ -441,6 +480,13 @@ rollback_profile() {
         rm -f "$SYSCTL_CONFIG"
     fi
     sysctl --system >>"$LOG_FILE" 2>&1
+    runtime_backup=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'runtime.*' 2>/dev/null | sort -r | head -n1 || true)
+    if [[ -n "$runtime_backup" ]]; then
+        sysctl -p "$runtime_backup" >>"$LOG_FILE" 2>&1
+        success "Прежние runtime-значения восстановлены из $runtime_backup"
+    else
+        warn "Снимок прежних runtime-значений отсутствует; для полного возврата потребуется перезагрузка"
+    fi
     success "Сетевой профиль откачен. Пакеты ядра не удалялись."
 }
 

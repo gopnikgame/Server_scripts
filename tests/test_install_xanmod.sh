@@ -4,6 +4,8 @@ set -euo pipefail
 
 TEST_DIR=${BASH_SOURCE[0]%/*}
 ROOT_DIR=$(cd "$TEST_DIR/.." && pwd)
+TEST_BACKUP_DIR=$(mktemp -d)
+export XANMOD_BACKUP_DIR="$TEST_BACKUP_DIR"
 
 # shellcheck source=../install_xanmod.sh
 source "$ROOT_DIR/install_xanmod.sh"
@@ -66,6 +68,26 @@ if grep -Eq 'tcp_tw_reuse|tcp_fin_timeout|busy_poll|rmem_default|tcp_fastopen|tc
     printf 'FAIL: unsafe or workload-unproven settings leaked into stable profile\n' >&2
     ((failures++))
 fi
+
+curl() {
+    [[ "$*" == *'-f'* ]] && return 99
+    return 0
+}
+assert_true 'repository reachability accepts an HTTP 404 response' repo_reachable
+
+sysctl() {
+    if [[ "$1" == '-n' ]]; then
+        case "$2" in
+            net.core.default_qdisc) printf 'fq_codel\n' ;;
+            net.ipv4.tcp_congestion_control) printf 'cubic\n' ;;
+            *) printf '123\n' ;;
+        esac
+    fi
+}
+runtime_file=$(backup_runtime_profile)
+grep -q '^net.core.default_qdisc=fq_codel$' "$runtime_file" || ((failures++))
+grep -q '^net.ipv4.tcp_congestion_control=cubic$' "$runtime_file" || ((failures++))
+rm -rf "$TEST_BACKUP_DIR"
 
 if (( failures > 0 )); then
     printf '%d XanMod installer test(s) failed\n' "$failures" >&2
