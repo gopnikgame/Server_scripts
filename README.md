@@ -140,10 +140,24 @@ x86-64-v2 и BIOS/GRUB: установка XanMod LTS 6.18, две переза�
 
 ### 7 · Auto Update VPS
 
-- Расписание: еженедельно / ежемесячно
-- Автоперезагрузка (опционально)
-- Защита конфигурационных файлов
-- Детальное логирование
+- полностью интерактивное меню без обязательных ключей командной строки;
+- предварительный план APT и отдельное подтверждение установки;
+- обычное и расширенное обновление с запретом удаления пакетов;
+- защита пакетов ядер XanMod/Ubuntu, GRUB, systemd, SSH, сети и Xray;
+- снимок списка пакетов, удержаний, текущего ядра и `/boot` перед установкой;
+- проверка `dpkg`, SSH, Xray, маршрута, DNS и failed units после установки;
+- расписание systemd: ежедневное, еженедельное или ежемесячное;
+- безопасный режим расписания по умолчанию только проверяет обновления.
+- мастер миграции отключает старый cron и удаляет глобальный legacy-файл APT
+  с `force-yes`, предварительно сохраняя их резервные копии.
+
+`autoremove` доступен только как просмотр плана. Автоматические удаление ядер
+и перезагрузка исключены; перезагрузка выполняется отдельным пунктом меню с
+подтверждением. Журнал расписания хранится в journald.
+
+> **Требуется тестирование на живой системе.** Локально проверяются синтаксис,
+> защита пакетов и формирование расписания. Установку пакетов и контроль
+> SSH/Xray необходимо проверить на тестовом VPS с консолью провайдера.
 
 ---
 
@@ -234,7 +248,8 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
 /etc/systemd/system/ssh-tunnel-proxy.service  # SSH туннель (если настроен)
 /var/log/server-scripts/                      # Логи launcher и модулей
 /var/log/xray/                                # Логи Xray
-/etc/auto_update_vps.conf                     # Конфигурация автообновления
+/etc/server-scripts-update.conf               # Конфигурация расписания обновлений
+/etc/systemd/system/server-scripts-update.*   # Служба и таймер обновлений
 ```
 
 ---
@@ -286,7 +301,7 @@ journalctl -u xray -f
 journalctl -u ssh-tunnel-proxy.service -f
 
 # Автообновление
-tail -f /var/log/auto_update_vps.log
+journalctl -u server-scripts-update.service -f
 ```
 
 ---
@@ -322,7 +337,8 @@ xray -test -config /usr/local/etc/xray/config.json
 journalctl -u ssh-tunnel-proxy.service -n 30
 
 # Автообновление
-cat /etc/auto_update_vps.conf
+cat /etc/server-scripts-update.conf
+systemctl list-timers server-scripts-update.timer
 ```
 
 ---

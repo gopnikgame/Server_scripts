@@ -1,823 +1,309 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Version: 2.0.0
+# Official references checked 2026-08-14:
+# https://manpages.debian.org/unstable/apt/apt-get.8.en.html
+# https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
+set -Eeuo pipefail
 
-# Version: 1.0.0
-# Author: gopnikgame
-# Created: 2025-02-20 20:00:00
-# Last Modified: 2025-02-20 20:00:00
-# Description: Automatic VPS update management module
+readonly VERSION="2.0.0"
+readonly RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m' BLUE='\033[0;34m' NC='\033[0m'
+readonly CONFIG_FILE="/etc/server-scripts-update.conf"
+readonly RUNNER_FILE="/usr/local/sbin/server-scripts-update-runner"
+readonly SERVICE_FILE="/etc/systemd/system/server-scripts-update.service"
+readonly TIMER_FILE="/etc/systemd/system/server-scripts-update.timer"
+readonly LOCK_FILE="/run/lock/server-scripts-update.lock"
+readonly BACKUP_ROOT="/var/backups/server-scripts/package-update"
+readonly LEGACY_CRON="/etc/cron.d/auto_update_vps"
+readonly LEGACY_RUNNER="/usr/local/sbin/auto_update_script.sh"
+readonly LEGACY_CONFIG="/etc/auto_update_vps.conf"
+readonly LEGACY_APT_CONFIG="/etc/apt/apt.conf.d/99auto-update"
 
-set -e
+print_header() { printf '\n%b=== %s ===%b\n\n' "$BLUE" "$1" "$NC"; }
+print_step() { printf '%bв†’%b %s\n' "$YELLOW" "$NC" "$1"; }
+print_success() { printf '%bвњ“%b %s\n' "$GREEN" "$NC" "$1"; }
+print_warning() { printf '%b!%b %s\n' "$YELLOW" "$NC" "$1"; }
+print_error() { printf '%bвњ—%b %s\n' "$RED" "$NC" "$1" >&2; }
+pause_menu() { read -r -p "РќР°Р¶РјРёС‚Рµ Enter РґР»СЏ РїСЂРѕРґРѕР»Р¶РµРЅРёСЏ..." _ || true; }
+confirm() { local answer; read -r -p "$1 [y/N]: " answer || return 1; [[ "$answer" =~ ^[Yy]$ ]]; }
 
-# Цветовые коды
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# Константы
-CRON_FILE="/etc/cron.d/auto_update_vps"
-UPDATE_SCRIPT="/usr/local/sbin/auto_update_script.sh"
-LOG_FILE="/var/log/auto_update_vps.log"
-CONFIG_FILE="/etc/auto_update_vps.conf"
-LOCK_FILE="/var/lock/auto_update_vps.lock"
-
-# Функции для красивого вывода
-print_header() {
-    local title="$1"
-    local width=50
-    local padding=$(( (width - ${#title}) / 2 ))
-    echo
-    echo -e "${BLUE}?$( printf '?%.0s' $(seq 1 $width) )?${NC}"
-    echo -e "${BLUE}?$( printf ' %.0s' $(seq 1 $padding) )${CYAN}$title$( printf ' %.0s' $(seq 1 $(( width - padding - ${#title} )) ) )${BLUE}?${NC}"
-    echo -e "${BLUE}?$( printf '?%.0s' $(seq 1 $width) )?${NC}"
-    echo
+require_root() { (( EUID == 0 )) || { print_error "Р—Р°РїСѓСЃС‚РёС‚Рµ РјРѕРґСѓР»СЊ РѕС‚ root."; exit 1; }; }
+require_supported_system() {
+    [[ -r /etc/os-release ]] || { print_error "РќРµ РЅР°Р№РґРµРЅ /etc/os-release."; return 1; }
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID:-}" in debian|ubuntu) ;; *) print_error "РџРѕРґРґРµСЂР¶РёРІР°СЋС‚СЃСЏ Debian Рё Ubuntu (РѕР±РЅР°СЂСѓР¶РµРЅРѕ: ${ID:-РЅРµРёР·РІРµСЃС‚РЅРѕ})."; return 1 ;; esac
+    command -v apt-get >/dev/null && command -v dpkg >/dev/null && command -v flock >/dev/null || {
+        print_error "РќСѓР¶РЅС‹ apt-get, dpkg Рё flock."; return 1;
+    }
 }
 
-print_step() {
-    echo -e "${YELLOW}?${NC} $1"
+with_lock() {
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || { print_error "Р”СЂСѓРіР°СЏ РѕРїРµСЂР°С†РёСЏ РѕР±РЅРѕРІР»РµРЅРёСЏ СѓР¶Рµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ."; return 1; }
+    "$@"
 }
 
-print_success() {
-    echo -e "${GREEN}?${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}?${NC} $1"
-}
-
-# Функция логирования
-log() {
-    local level="$1"
-    shift
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-    case "$level" in
-        "INFO") local color=$GREEN ;;
-   "WARNING") local color=$YELLOW ;;
-        "ERROR") local color=$RED ;;
-  *) local color=$NC ;;
-    esac
-    echo -e "${timestamp} [${color}${level}${NC}] $*"
-    echo "${timestamp} [${level}] $*" >> "$LOG_FILE"
-}
-
-# Проверка root прав
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        log "ERROR" "Этот скрипт должен быть запущен с правами root"
-        exit 1
-    fi
-}
-
-# Проверка статуса автообновления
-check_auto_update_status() {
-    if [ -f "$CONFIG_FILE" ] && [ -f "$CRON_FILE" ]; then
-        return 0  # Включено
-    else
-        return 1  # Отключено
-    fi
-}
-
-# Получение настроек из конфига
-get_config_value() {
-    local key="$1"
-    local default="$2"
-    
-    if [ -f "$CONFIG_FILE" ]; then
-        local value=$(grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2-)
-        echo "${value:-$default}"
-    else
-      echo "$default"
-    fi
-}
-
-# Показ текущих настроек
-show_current_settings() {
-    if ! check_auto_update_status; then
-        echo -e "Статус: ${RED}Отключено${NC}"
+preflight() {
+    if [[ -e "$LEGACY_APT_CONFIG" ]]; then
+        print_error "РќР°Р№РґРµРЅ СЃС‚Р°СЂС‹Р№ $LEGACY_APT_CONFIG СЃ РЅРµР±РµР·РѕРїР°СЃРЅС‹РјРё РіР»РѕР±Р°Р»СЊРЅС‹РјРё РїР°СЂР°РјРµС‚СЂР°РјРё APT."
+        print_error "РЎРЅР°С‡Р°Р»Р° РІС‹Р±РµСЂРёС‚Рµ РїСѓРЅРєС‚ РјРµРЅСЋ В«РћР±РµР·РІСЂРµРґРёС‚СЊ СЃС‚Р°СЂСѓСЋ РІРµСЂСЃРёСЋВ»."
         return 1
     fi
-    
-    local update_schedule=$(get_config_value "UPDATE_SCHEDULE" "неизвестно")
-    local auto_reboot=$(get_config_value "AUTO_REBOOT" "no")
-    local update_time=$(get_config_value "UPDATE_TIME" "03:00")
-  local last_update=$(get_config_value "LAST_UPDATE" "никогда")
-    
-    echo -e "Статус:       ${GREEN}Включено${NC}"
-    echo -e "График обновлений:    ${BLUE}$update_schedule${NC}"
-  echo -e "Время обновления: ${BLUE}$update_time${NC}"
-    echo -e "Автоперезагрузка:     $([ "$auto_reboot" = "yes" ] && echo -e "${GREEN}Включена${NC}" || echo -e "${YELLOW}Отключена${NC}")"
-    
-    if [ "$last_update" != "никогда" ]; then
- echo -e "Последнее обновление: ${CYAN}$last_update${NC}"
-    else
-        echo -e "Последнее обновление: ${YELLOW}$last_update${NC}"
-    fi
-    
-    # Проверка наличия логов
-    if [ -f "$LOG_FILE" ]; then
-        local log_size=$(du -h "$LOG_FILE" 2>/dev/null | cut -f1)
-        echo -e "Размер лога:  ${CYAN}$log_size${NC}"
-    fi
-    
-    return 0
+    print_step "РџСЂРѕРІРµСЂРєР° dpkg, Р·Р°РІРёСЃРёРјРѕСЃС‚РµР№ Рё СЃРІРѕР±РѕРґРЅРѕРіРѕ РјРµСЃС‚Р°"
+    local audit; audit="$(dpkg --audit 2>&1 || true)"
+    [[ -z "$audit" ]] || { print_error "dpkg СЃРѕРѕР±С‰Р°РµС‚ Рѕ РЅРµР·Р°РІРµСЂС€С‘РЅРЅС‹С… РѕРїРµСЂР°С†РёСЏС…:"; printf '%s\n' "$audit"; return 1; }
+    apt-get check
+    df -h / /boot 2>/dev/null || df -h /
 }
 
-# Создание скрипта обновления
-create_update_script() {
-    local auto_reboot="$1"
-    
-cat > "$UPDATE_SCRIPT" << 'EOF'
-#!/bin/bash
-
-# Автоматический скрипт обновления VPS
-# Создан модулем auto_update_vps.sh
-
-LOG_FILE="/var/log/auto_update_vps.log"
-LOCK_FILE="/var/lock/auto_update_vps.lock"
-CONFIG_FILE="/etc/auto_update_vps.conf"
-
-# Функция логирования
-log_message() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+create_snapshot() {
+    local dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+    install -d -m 0700 "$dir"
+    dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$dir/packages.tsv"
+    apt-mark showmanual > "$dir/manual-packages.txt"
+    apt-mark showhold > "$dir/held-packages.txt"
+    uname -a > "$dir/running-kernel.txt"
+    find /boot -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort > "$dir/boot-files.txt" || true
+    systemctl --failed --no-legend > "$dir/failed-units-before.txt" 2>/dev/null || true
+    printf '%s\n' "$dir"
 }
 
-# Проверка блокировки (предотвращение одновременного запуска)
-if [ -f "$LOCK_FILE" ]; then
-    log_message "INFO: Обновление уже выполняется, выход"
-    exit 0
-fi
-
-# Создание файла блокировки
-touch "$LOCK_FILE"
-trap "rm -f $LOCK_FILE" EXIT
-
-log_message "======================================"
-log_message "INFO: Начало автоматического обновления"
-log_message "======================================"
-
-# Обновление списка пакетов
-log_message "INFO: Обновление списка пакетов..."
-if ! apt-get update >> "$LOG_FILE" 2>&1; then
-    log_message "ERROR: Ошибка при обновлении списка пакетов"
-    exit 1
-fi
-log_message "INFO: Список пакетов успешно обновлен"
-
-# Проверка доступных обновлений
-UPDATES_AVAILABLE=$(apt-get -s upgrade 2>/dev/null | grep -c "^Inst")
-log_message "INFO: Доступно обновлений: $UPDATES_AVAILABLE"
-
-if [ "$UPDATES_AVAILABLE" -eq 0 ]; then
-    log_message "INFO: Нет доступных обновлений"
-    
-  # Обновляем дату последнего обновления
-    if [ -f "$CONFIG_FILE" ]; then
-        sed -i "s/^LAST_UPDATE=.*/LAST_UPDATE=$(date '+%Y-%m-%d %H:%M:%S')/" "$CONFIG_FILE"
-    fi
-    
-    exit 0
-fi
-
-# Установка переменных окружения для автоматических ответов
-export DEBIAN_FRONTEND=noninteractive
-export DEBIAN_PRIORITY=critical
-
-# Настройка dpkg для сохранения существующих конфигов
-cat > /etc/apt/apt.conf.d/99auto-update << 'APTCONF'
-Dpkg::Options {
-   "--force-confdef";
-   "--force-confold";
+simulation() {
+    case "$1" in
+        safe) apt-get -s upgrade --with-new-pkgs --no-remove ;;
+        expanded) apt-get -s dist-upgrade --no-remove ;;
+        autoremove) apt-get -s autoremove ;;
+        *) return 2 ;;
+    esac
 }
-APT::Get::Assume-Yes "true";
-APT::Get::force-yes "true";
-APTCONF
+simulation_removals() { sed -n 's/^Remv \([^ ]*\).*/\1/p'; }
 
-# Выполнение обновления пакетов
-log_message "INFO: Установка обновлений..."
-if ! apt-get upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1; then
-    log_message "ERROR: Ошибка при установке обновлений"
-    exit 1
-fi
-log_message "INFO: Обновления успешно установлены"
-
-# Выполнение dist-upgrade для системных пакетов
-log_message "INFO: Выполнение dist-upgrade..."
-if ! apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" >> "$LOG_FILE" 2>&1; then
-    log_message "WARNING: Возможны ошибки при dist-upgrade"
-fi
-
-# Автоочистка
-log_message "INFO: Очистка ненужных пакетов..."
-apt-get autoremove -y >> "$LOG_FILE" 2>&1
-apt-get autoclean >> "$LOG_FILE" 2>&1
-log_message "INFO: Очистка завершена"
-
-# Обновление даты последнего обновления
-if [ -f "$CONFIG_FILE" ]; then
-    sed -i "s/^LAST_UPDATE=.*/LAST_UPDATE=$(date '+%Y-%m-%d %H:%M:%S')/" "$CONFIG_FILE"
-fi
-
-# Проверка необходимости перезагрузки
-REBOOT_REQUIRED=false
-if [ -f /var/run/reboot-required ]; then
-    REBOOT_REQUIRED=true
-    log_message "WARNING: Требуется перезагрузка системы"
-fi
-
-log_message "======================================"
-log_message "INFO: Обновление завершено успешно"
-log_message "======================================"
-
-EOF
-
-    # Добавление автоперезагрузки если включена
-  if [ "$auto_reboot" = "yes" ]; then
-        cat >> "$UPDATE_SCRIPT" << 'EOF'
-
-# Автоматическая перезагрузка
-AUTO_REBOOT=$(grep "^AUTO_REBOOT=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-if [ "$AUTO_REBOOT" = "yes" ] && [ "$REBOOT_REQUIRED" = true ]; then
-    log_message "INFO: Выполняется автоматическая перезагрузка..."
-    shutdown -r +2 "Автоматическая перезагрузка после обновления через 2 минуты" >> "$LOG_FILE" 2>&1
-fi
-EOF
-    fi
-
-    chmod +x "$UPDATE_SCRIPT"
-    log "INFO" "Скрипт обновления создан: $UPDATE_SCRIPT"
+is_protected_package() {
+    local p="${1%%:*}"
+    case "$p" in
+        linux-image-*|linux-headers-*|linux-modules-*|linux-xanmod-*|linux-generic*|linux-virtual*|grub*|systemd*|\
+        initramfs-tools*|openssh-server|ssh|xray|xray-core|network-manager|netplan.io|ifupdown) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
-# Настройка расписания cron
-setup_cron_schedule() {
-    local schedule_type="$1"
-    local update_time="$2"
-  
-    # Разбиваем время на часы и минуты
-    local hour=$(echo "$update_time" | cut -d':' -f1)
-    local minute=$(echo "$update_time" | cut -d':' -f2)
-    
- # Валидация времени
-    if ! [[ "$hour" =~ ^[0-9]{1,2}$ ]] || [ "$hour" -gt 23 ] || [ "$hour" -lt 0 ]; then
-        hour=3
+check_protected_removals() {
+    local p found=0
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if is_protected_package "$p"; then print_error "РџР»Р°РЅ РїСЂРµРґР»Р°РіР°РµС‚ СѓРґР°Р»РёС‚СЊ Р·Р°С‰РёС‰С‘РЅРЅС‹Р№ РїР°РєРµС‚: $p"; found=1; fi
+    done
+    (( found == 0 ))
+}
+
+service_state() { systemctl is-active --quiet "$1" 2>/dev/null && printf active || printf inactive; }
+postflight() {
+    local ssh_before="$1" xray_before="$2" failed=0
+    print_step "РљРѕРЅС‚СЂРѕР»СЊ РїРѕСЃР»Рµ РѕР±РЅРѕРІР»РµРЅРёСЏ"
+    [[ -z "$(dpkg --audit 2>&1 || true)" ]] || failed=1
+    apt-get check || failed=1
+    if [[ "$ssh_before" == active ]] && ! systemctl is-active --quiet ssh 2>/dev/null && ! systemctl is-active --quiet sshd 2>/dev/null; then
+        print_error "SSH Р±С‹Р» Р°РєС‚РёРІРµРЅ, РЅРѕ С‚РµРїРµСЂСЊ РЅРµР°РєС‚РёРІРµРЅ. РќРµ Р·Р°РєСЂС‹РІР°Р№С‚Рµ С‚РµРєСѓС‰СѓСЋ СЃРµСЃСЃРёСЋ."; failed=1
     fi
-    if ! [[ "$minute" =~ ^[0-9]{1,2}$ ]] || [ "$minute" -gt 59 ] || [ "$minute" -lt 0 ]; then
-        minute=0
+    if [[ "$xray_before" == active ]] && ! systemctl is-active --quiet xray 2>/dev/null; then
+        print_error "Xray Р±С‹Р» Р°РєС‚РёРІРµРЅ, РЅРѕ С‚РµРїРµСЂСЊ РЅРµР°РєС‚РёРІРµРЅ."; failed=1
     fi
-    
-    local cron_schedule=""
-    local schedule_description=""
-    
-    case "$schedule_type" in
-     "weekly")
-       # Каждое воскресенье в указанное время
-      cron_schedule="$minute $hour * * 0"
-     schedule_description="Еженедельно (каждое воскресенье)"
+    ip route show default || { print_error "РќРµ РЅР°Р№РґРµРЅ РјР°СЂС€СЂСѓС‚ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ."; failed=1; }
+    getent ahosts deb.debian.org >/dev/null 2>&1 || getent ahosts archive.ubuntu.com >/dev/null 2>&1 || {
+        print_warning "РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕРґС‚РІРµСЂРґРёС‚СЊ DNS С‡РµСЂРµР· СЃС‚Р°РЅРґР°СЂС‚РЅС‹Рµ Р°СЂС…РёРІС‹."; failed=1;
+    }
+    systemctl --failed --no-pager 2>/dev/null || true
+    [[ ! -e /var/run/reboot-required ]] || print_warning "РўСЂРµР±СѓРµС‚СЃСЏ СЂСѓС‡РЅР°СЏ РїРµСЂРµР·Р°РіСЂСѓР·РєР°; Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё РѕРЅР° РЅРµ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ."
+    (( failed == 0 ))
+}
+
+legacy_present() {
+    [[ -e "$LEGACY_CRON" || -e "$LEGACY_RUNNER" || -e "$LEGACY_CONFIG" || -e "$LEGACY_APT_CONFIG" ]]
+}
+
+disable_legacy() {
+    legacy_present || { print_success "Р¤Р°Р№Р»С‹ СЃС‚Р°СЂРѕР№ РІРµСЂСЃРёРё РЅРµ РЅР°Р№РґРµРЅС‹."; return 0; }
+    print_warning "Р‘СѓРґСѓС‚ РѕС‚РєР»СЋС‡РµРЅС‹ СЃС‚Р°СЂС‹Р№ cron, runner Рё РіР»РѕР±Р°Р»СЊРЅС‹Р№ APT force-yes. РЎС‚Р°СЂС‹Р№ Р¶СѓСЂРЅР°Р» СЃРѕС…СЂР°РЅРёС‚СЃСЏ."
+    confirm "РЎРѕР·РґР°С‚СЊ СЂРµР·РµСЂРІРЅСѓСЋ РєРѕРїРёСЋ Рё РѕС‚РєР»СЋС‡РёС‚СЊ СЃС‚Р°СЂСѓСЋ РІРµСЂСЃРёСЋ?" || return 0
+    local dir="$BACKUP_ROOT/legacy-$(date +%Y%m%d-%H%M%S)" file
+    install -d -m 0700 "$dir"
+    for file in "$LEGACY_CRON" "$LEGACY_RUNNER" "$LEGACY_CONFIG" "$LEGACY_APT_CONFIG"; do
+        if [[ -e "$file" ]]; then
+            cp -a "$file" "$dir/"
+            rm -f "$file"
+        fi
+    done
+    print_success "РЎС‚Р°СЂР°СЏ РІРµСЂСЃРёСЏ РѕС‚РєР»СЋС‡РµРЅР°. Р РµР·РµСЂРІРЅР°СЏ РєРѕРїРёСЏ: $dir"
+}
+
+perform_update() {
+    local mode="$1" plan backup ssh_before xray_before
+    preflight || return 1
+    print_step "РћР±РЅРѕРІР»РµРЅРёРµ РёРЅРґРµРєСЃРѕРІ APT"; apt-get update
+    plan="$(simulation "$mode")" || { print_error "APT РЅРµ СЃРјРѕРі РїРѕСЃС‚СЂРѕРёС‚СЊ РїР»Р°РЅ."; return 1; }
+    printf '\n%s\n' "$plan"
+    check_protected_removals < <(printf '%s\n' "$plan" | simulation_removals) || {
+        print_error "РћРїРµСЂР°С†РёСЏ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅР°."; return 1;
+    }
+    grep -qE '^(Inst|Remv|Conf) ' <<< "$plan" || { print_success "Р”РѕСЃС‚СѓРїРЅС‹С… РѕР±РЅРѕРІР»РµРЅРёР№ РЅРµС‚."; return 0; }
+    confirm "РџСЂРёРјРµРЅРёС‚СЊ СЌС‚РѕС‚ РїР»Р°РЅ Р±РµР· autoremove Рё РїРµСЂРµР·Р°РіСЂСѓР·РєРё?" || { print_warning "РћС‚РјРµРЅРµРЅРѕ."; return 0; }
+    backup="$(create_snapshot)"; print_success "РЎРЅРёРјРѕРє СЃРѕСЃС‚РѕСЏРЅРёСЏ: $backup"
+    ssh_before="$(service_state ssh)"; [[ "$ssh_before" == active ]] || ssh_before="$(service_state sshd)"
+    xray_before="$(service_state xray)"
+    export DEBIAN_FRONTEND=noninteractive
+    case "$mode" in
+        safe) apt-get upgrade --with-new-pkgs --no-remove -y -o Dpkg::Options::=--force-confold ;;
+        expanded) apt-get dist-upgrade --no-remove -y -o Dpkg::Options::=--force-confold ;;
+    esac
+    postflight "$ssh_before" "$xray_before"
+}
+
+show_status() {
+    print_header "РЎРѕСЃС‚РѕСЏРЅРёРµ СЃРµСЂРІРµСЂР°"
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf 'РЎРёСЃС‚РµРјР°: %s\nРЇРґСЂРѕ: %s\nРџРµСЂРµР·Р°РіСЂСѓР·РєР°: %s\nРўР°Р№РјРµСЂ: %s\n' "${PRETTY_NAME:-РЅРµРёР·РІРµСЃС‚РЅРѕ}" "$(uname -r)" \
+        "$([[ -e /var/run/reboot-required ]] && echo С‚СЂРµР±СѓРµС‚СЃСЏ || echo 'РЅРµ С‚СЂРµР±СѓРµС‚СЃСЏ')" \
+        "$(systemctl is-enabled server-scripts-update.timer 2>/dev/null || echo 'РЅРµ РЅР°СЃС‚СЂРѕРµРЅ')"
+    printf '\nРћР±РЅРѕРІР»РµРЅРёСЏ РїРѕ С‚РµРєСѓС‰РёРј РёРЅРґРµРєСЃР°Рј:\n'
+    apt-get -s upgrade --with-new-pkgs --no-remove 2>/dev/null | grep '^Inst ' || echo "  РЅРµ РЅР°Р№РґРµРЅС‹ РёР»Рё РёРЅРґРµРєСЃС‹ СѓСЃС‚Р°СЂРµР»Рё"
+    printf '\nРЎР»СѓР¶Р±С‹ СЃ РѕС€РёР±РєР°РјРё:\n'; systemctl --failed --no-pager 2>/dev/null || true
+    df -h / /boot 2>/dev/null || df -h /
+}
+
+show_autoremove_plan() {
+    print_header "РўРѕР»СЊРєРѕ РїСЂРѕСЃРјРѕС‚СЂ autoremove"
+    print_warning "РњРѕРґСѓР»СЊ РЅРёРєРѕРіРґР° РЅРµ Р·Р°РїСѓСЃРєР°РµС‚ autoremove Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё."
+    local plan removals; plan="$(simulation autoremove)"; printf '%s\n' "$plan"
+    removals="$(printf '%s\n' "$plan" | simulation_removals)"
+    [[ -z "$removals" ]] || check_protected_removals <<< "$removals" || print_warning "РЈРґР°Р»РµРЅРёРµ Р·Р°Р±Р»РѕРєРёСЂРѕРІР°РЅРѕ."
+}
+
+valid_time() { [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+calendar_for_period() {
+    case "$1" in
+        daily) printf '*-*-* %s:00' "$2" ;;
+        weekly) printf 'Sun *-*-* %s:00' "$2" ;;
+        monthly) printf '*-*-01 %s:00' "$2" ;;
+        *) return 1 ;;
+    esac
+}
+
+install_scheduler() {
+    command -v systemctl >/dev/null || { print_error "systemd РЅРµ РЅР°Р№РґРµРЅ."; return 1; }
+    legacy_present && { print_error "РЎРЅР°С‡Р°Р»Р° РѕР±РµР·РІСЂРµРґСЊС‚Рµ СЃС‚Р°СЂСѓСЋ РІРµСЂСЃРёСЋ С‡РµСЂРµР· РїСѓРЅРєС‚ 9."; return 1; }
+    print_header "Р Р°СЃРїРёСЃР°РЅРёРµ Р±РµР·РѕРїР°СЃРЅС‹С… РѕР±РЅРѕРІР»РµРЅРёР№"
+    echo "1. Р•Р¶РµРґРЅРµРІРЅРѕ"; echo "2. Р•Р¶РµРЅРµРґРµР»СЊРЅРѕ (СЂРµРєРѕРјРµРЅРґСѓРµС‚СЃСЏ)"; echo "3. Р•Р¶РµРјРµСЃСЏС‡РЅРѕ"
+    local choice period time mode calendar
+    read -r -p "РџРµСЂРёРѕРґ [1-3]: " choice
+    case "$choice" in 1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; *) print_error "РќРµРІРµСЂРЅС‹Р№ РІС‹Р±РѕСЂ."; return 1 ;; esac
+    read -r -p "Р’СЂРµРјСЏ Р§Р§:РњРњ [03:00]: " time; time="${time:-03:00}"
+    valid_time "$time" || { print_error "РќРµРІРµСЂРЅРѕРµ РІСЂРµРјСЏ."; return 1; }
+    echo "1. РўРѕР»СЊРєРѕ РїСЂРѕРІРµСЂСЏС‚СЊ (СЂРµРєРѕРјРµРЅРґСѓРµС‚СЃСЏ)"; echo "2. РЈСЃС‚Р°РЅР°РІР»РёРІР°С‚СЊ Р±РµР· СѓРґР°Р»РµРЅРёСЏ РїР°РєРµС‚РѕРІ"
+    read -r -p "Р РµР¶РёРј [1-2]: " choice
+    case "$choice" in 1) mode=check ;; 2) mode=upgrade ;; *) print_error "РќРµРІРµСЂРЅС‹Р№ РІС‹Р±РѕСЂ."; return 1 ;; esac
+    [[ "$mode" == check ]] || confirm "Р Р°Р·СЂРµС€РёС‚СЊ РїР»Р°РЅРѕРІСѓСЋ СѓСЃС‚Р°РЅРѕРІРєСѓ Р±РµР· reboot Рё autoremove?" || return 0
+    calendar="$(calendar_for_period "$period" "$time")"
+    install -d -m 0755 "$(dirname "$RUNNER_FILE")"
+    cat > "$RUNNER_FILE" <<'RUNNER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec 9>/run/lock/server-scripts-update.lock
+flock -n 9 || exit 0
+mode="${1:-check}"
+apt-get update
+apt-get check
+case "$mode" in
+ check) apt-get -s upgrade --with-new-pkgs --no-remove ;;
+ upgrade)
+  backup="/var/backups/server-scripts/package-update/scheduled-$(date +%Y%m%d-%H%M%S)"
+  install -d -m 0700 "$backup"
+  dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$backup/packages.tsv"
+  apt-mark showmanual > "$backup/manual-packages.txt"
+  apt-mark showhold > "$backup/held-packages.txt"
+  uname -a > "$backup/running-kernel.txt"
+  ssh_before=inactive; xray_before=inactive
+  systemctl is-active --quiet ssh 2>/dev/null && ssh_before=active || true
+  systemctl is-active --quiet sshd 2>/dev/null && ssh_before=active || true
+  systemctl is-active --quiet xray 2>/dev/null && xray_before=active || true
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get upgrade --with-new-pkgs --no-remove -y -o Dpkg::Options::=--force-confold
+  test -z "$(dpkg --audit 2>&1 || true)"; apt-get check
+  [ "$ssh_before" != active ] || systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd
+  [ "$xray_before" != active ] || systemctl is-active --quiet xray
+  ip route show default
+  systemctl --failed --no-pager || true
+  [ ! -e /var/run/reboot-required ] || echo "РўСЂРµР±СѓРµС‚СЃСЏ СЂСѓС‡РЅР°СЏ РїРµСЂРµР·Р°РіСЂСѓР·РєР°."
   ;;
-   "biweekly")
-            # Каждые две недели (1-е и 15-е число)
-      cron_schedule="$minute $hour 1,15 * *"
-      schedule_description="Раз в две недели (1-го и 15-го числа)"
-            ;;
-        "monthly")
-   # Первое число каждого месяца
-  cron_schedule="$minute $hour 1 * *"
-     schedule_description="Ежемесячно (1-го числа)"
-        ;;
-        "daily")
-            # Каждый день (для тестирования)
-            cron_schedule="$minute $hour * * *"
-            schedule_description="Ежедневно"
- ;;
-        *)
-            log "ERROR" "Неизвестный тип расписания: $schedule_type"
-return 1
-      ;;
-    esac
-    
-    # Создание файла cron
-    cat > "$CRON_FILE" << EOF
-# Автоматическое обновление VPS
-# Расписание: $schedule_description в ${hour}:$(printf "%02d" $minute)
-# Создано: $(date '+%Y-%m-%d %H:%M:%S')
-
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-
-$cron_schedule root $UPDATE_SCRIPT
+ *) echo "РќРµРёР·РІРµСЃС‚РЅС‹Р№ СЂРµР¶РёРј: $mode" >&2; exit 2 ;;
+esac
+RUNNER
+    chmod 0755 "$RUNNER_FILE"
+    printf 'MODE=%s\nPERIOD=%s\nTIME=%s\n' "$mode" "$period" "$time" > "$CONFIG_FILE"; chmod 0600 "$CONFIG_FILE"
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=Server Scripts safe APT maintenance
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$RUNNER_FILE $mode
 EOF
-
-    chmod 644 "$CRON_FILE"
-    log "INFO" "Расписание cron настроено: $schedule_description в ${hour}:$(printf "%02d" $minute)"
-    
-    echo "$schedule_description"
+    cat > "$TIMER_FILE" <<EOF
+[Unit]
+Description=Schedule Server Scripts safe APT maintenance
+[Timer]
+OnCalendar=$calendar
+Persistent=true
+RandomizedDelaySec=15m
+Unit=server-scripts-update.service
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload; systemctl enable --now server-scripts-update.timer
+    systemctl list-timers server-scripts-update.timer --no-pager
+    print_success "Р Р°СЃРїРёСЃР°РЅРёРµ СѓСЃС‚Р°РЅРѕРІР»РµРЅРѕ. РђРІС‚РѕРјР°С‚РёС‡РµСЃРєРёРµ reboot Рё autoremove РѕС‚РєР»СЋС‡РµРЅС‹."
 }
 
-# Включение автоматического обновления
-enable_auto_update() {
-    print_header "Настройка автоматического обновления"
+disable_scheduler() {
+    systemctl disable --now server-scripts-update.timer 2>/dev/null || true
+    rm -f "$SERVICE_FILE" "$TIMER_FILE" "$RUNNER_FILE" "$CONFIG_FILE"
+    systemctl daemon-reload 2>/dev/null || true
+    print_success "Р Р°СЃРїРёСЃР°РЅРёРµ СѓРґР°Р»РµРЅРѕ; Р¶СѓСЂРЅР°Р» СЃРѕС…СЂР°РЅС‘РЅ."
+}
+view_logs() { journalctl -u server-scripts-update.service -n 150 --no-pager 2>/dev/null || print_warning "Р–СѓСЂРЅР°Р» РїСѓСЃС‚."; }
+manual_reboot() {
+    [[ -e /var/run/reboot-required ]] || { print_warning "РџРµСЂРµР·Р°РіСЂСѓР·РєР° РЅРµ С‚СЂРµР±СѓРµС‚СЃСЏ."; return 0; }
+    print_warning "SSH-СЃРµСЃСЃРёСЏ Р±СѓРґРµС‚ СЂР°Р·РѕСЂРІР°РЅР°. РЈР±РµРґРёС‚РµСЃСЊ, С‡С‚Рѕ РґРѕСЃС‚СѓРїРЅР° РєРѕРЅСЃРѕР»СЊ РїСЂРѕРІР°Р№РґРµСЂР°."
+    if confirm "РџРµСЂРµР·Р°РіСЂСѓР·РёС‚СЊ СЃРµР№С‡Р°СЃ?"; then systemctl reboot; fi
+}
 
-    # Выбор графика обновлений
-    echo -e "${YELLOW}=== Выбор графика обновлений ===${NC}"
-    echo "1. Еженедельно (каждое воскресенье)"
-    echo "2. Раз в две недели (1-го и 15-го числа)"
-    echo "3. Ежемесячно (1-го числа каждого месяца)"
-    echo "4. Ежедневно (для тестирования)"
-    echo
-    
-    local schedule_type=""
-    local schedule_name=""
-    
+main_menu() {
+    require_root; require_supported_system
     while true; do
-   read -p "Выберите график обновлений [1-4, по умолчанию 1]: " choice
-        choice="${choice:-1}"
-        
+        print_header "Р‘РµР·РѕРїР°СЃРЅРѕРµ РѕР±РЅРѕРІР»РµРЅРёРµ VPS v$VERSION"
+        echo "1. РЎРѕСЃС‚РѕСЏРЅРёРµ Рё РґРѕСЃС‚СѓРїРЅС‹Рµ РѕР±РЅРѕРІР»РµРЅРёСЏ"
+        echo "2. Р‘РµР·РѕРїР°СЃРЅРѕРµ РѕР±РЅРѕРІР»РµРЅРёРµ (СЂРµРєРѕРјРµРЅРґСѓРµС‚СЃСЏ)"
+        echo "3. Р Р°СЃС€РёСЂРµРЅРЅРѕРµ РѕР±РЅРѕРІР»РµРЅРёРµ Р±РµР· СѓРґР°Р»РµРЅРёСЏ РїР°РєРµС‚РѕРІ"
+        echo "4. РџСЂРѕСЃРјРѕС‚СЂРµС‚СЊ autoremove (Р±РµР· РІС‹РїРѕР»РЅРµРЅРёСЏ)"
+        echo "5. РќР°СЃС‚СЂРѕРёС‚СЊ СЂР°СЃРїРёСЃР°РЅРёРµ systemd"
+        echo "6. РџРѕРєР°Р·Р°С‚СЊ Р¶СѓСЂРЅР°Р» СЂР°СЃРїРёСЃР°РЅРёСЏ"
+        echo "7. РћС‚РєР»СЋС‡РёС‚СЊ СЂР°СЃРїРёСЃР°РЅРёРµ"
+        echo "8. Р СѓС‡РЅР°СЏ РїРµСЂРµР·Р°РіСЂСѓР·РєР°, РµСЃР»Рё С‚СЂРµР±СѓРµС‚СЃСЏ"
+        echo "9. РћР±РµР·РІСЂРµРґРёС‚СЊ СЃС‚Р°СЂСѓСЋ РІРµСЂСЃРёСЋ (cron / force-yes)"
+        echo "0. РќР°Р·Р°Рґ"
+        legacy_present && print_warning "РћР±РЅР°СЂСѓР¶РµРЅС‹ Р°РєС‚РёРІРЅС‹Рµ С„Р°Р№Р»С‹ СЃС‚Р°СЂРѕРіРѕ Р°РІС‚РѕРѕР±РЅРѕРІР»РµРЅРёСЏ. Р’С‹Р±РµСЂРёС‚Рµ РїСѓРЅРєС‚ 9."
+        local choice; read -r -p "Р”РµР№СЃС‚РІРёРµ [0-9]: " choice
         case "$choice" in
-  1)
-    schedule_type="weekly"
-    schedule_name="Еженедельно"
-  break
-              ;;
-        2)
-         schedule_type="biweekly"
-     schedule_name="Раз в две недели"
-                break
-          ;;
-            3)
-     schedule_type="monthly"
-                schedule_name="Ежемесячно"
-          break
-       ;;
-        4)
-   schedule_type="daily"
-     schedule_name="Ежедневно"
-    echo -e "${YELLOW}? Внимание: Ежедневные обновления рекомендуются только для тестирования${NC}"
-            break
- ;;
-   *)
-       print_error "Неверный выбор, попробуйте снова"
-    ;;
+            1) show_status ;; 2) with_lock perform_update safe || true ;;
+            3) print_warning "APT РѕСЃС‚Р°РЅРѕРІРёС‚СЃСЏ РїСЂРё РїРѕРїС‹С‚РєРµ СѓРґР°Р»РёС‚СЊ Р»СЋР±РѕР№ РїР°РєРµС‚."; with_lock perform_update expanded || true ;;
+            4) show_autoremove_plan || true ;; 5) install_scheduler || true ;; 6) view_logs ;;
+            7) if confirm "РЈРґР°Р»РёС‚СЊ СЂР°СЃРїРёСЃР°РЅРёРµ?"; then disable_scheduler; fi ;; 8) manual_reboot ;; 9) disable_legacy ;; 0) return 0 ;;
+            *) print_error "РќРµРІРµСЂРЅС‹Р№ РІС‹Р±РѕСЂ." ;;
         esac
-    done
-    
- log "INFO" "Выбран график обновлений: $schedule_name"
-    
-    # Выбор времени обновления
- echo
-    echo -e "${YELLOW}=== Выбор времени обновления ===${NC}"
-    echo "Рекомендуется выбирать ночное время с минимальной нагрузкой"
-    echo "Формат: ЧЧ:ММ (например, 03:00 для 3 часов ночи)"
-    echo
-    
-    local update_time="03:00"
-    while true; do
- read -p "Введите время обновления [по умолчанию 03:00]: " input_time
-        input_time="${input_time:-03:00}"
-        
-        # Проверка формата времени
-        if [[ "$input_time" =~ ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-            update_time="$input_time"
-    break
- else
-       print_error "Неверный формат времени. Используйте формат ЧЧ:ММ"
-        fi
-    done
-    
-    log "INFO" "Выбрано время обновления: $update_time"
-    
-    # Автоматическая перезагрузка
-  echo
-    echo -e "${YELLOW}=== Настройка автоматической перезагрузки ===${NC}"
-    echo "После обновления некоторых системных компонентов может потребоваться перезагрузка."
-    echo -e "${CYAN}Если включена автоперезагрузка, система будет автоматически перезагружена${NC}"
-    echo -e "${CYAN}через 2 минуты после обновления (при необходимости).${NC}"
-    echo
-    
-    local auto_reboot="no"
-    read -p "Включить автоматическую перезагрузку после обновления? [y/N]: " reboot_choice
-    
-    if [[ "$reboot_choice" =~ ^[Yy]$ ]]; then
- auto_reboot="yes"
-        log "INFO" "Автоматическая перезагрузка включена"
-     echo -e "${GREEN}? Автоматическая перезагрузка включена${NC}"
-    else
-        log "INFO" "Автоматическая перезагрузка отключена"
-        echo -e "${YELLOW}? Автоматическая перезагрузка отключена${NC}"
-    fi
-    
-    # Создание конфигурационного файла
-    print_step "Создание конфигурационного файла..."
-    cat > "$CONFIG_FILE" << EOF
-# Конфигурация автоматического обновления VPS
-# Создано: $(date '+%Y-%m-%d %H:%M:%S')
-
-UPDATE_SCHEDULE=$schedule_name
-SCHEDULE_TYPE=$schedule_type
-UPDATE_TIME=$update_time
-AUTO_REBOOT=$auto_reboot
-LAST_UPDATE=никогда
-EOF
-
-    # Создание скрипта обновления
-    print_step "Создание скрипта обновления..."
-    create_update_script "$auto_reboot"
-    
-    # Настройка расписания cron
-    print_step "Настройка расписания обновлений..."
-    local schedule_desc=$(setup_cron_schedule "$schedule_type" "$update_time")
-    
-    # Создание директории для логов
-    mkdir -p "$(dirname "$LOG_FILE")"
-    touch "$LOG_FILE"
-    chmod 644 "$LOG_FILE"
-    
-    log "INFO" "Автоматическое обновление успешно настроено"
-    print_success "Автоматическое обновление успешно настроено"
-    
-    # Вывод итоговой информации
-    echo
-    echo -e "${CYAN}??????????????????????????????????????????????????${NC}"
-  echo -e "${CYAN}?${NC}     ${GREEN}Автоматическое обновление настроено${NC}     ${CYAN}?${NC}"
-    echo -e "${CYAN}??????????????????????????????????????????????????${NC}"
-    echo
-  echo -e "${YELLOW}Параметры:${NC}"
-  echo -e "  График:  ${BLUE}$schedule_name${NC}"
-    echo -e "  Время:          ${BLUE}$update_time${NC}"
-    echo -e "  Автоперезагрузка: $([ "$auto_reboot" = "yes" ] && echo -e "${GREEN}Включена${NC}" || echo -e "${YELLOW}Отключена${NC}")"
-    echo
-    echo -e "${YELLOW}Информация:${NC}"
-    echo -e "  Файл конфигурации: ${CYAN}$CONFIG_FILE${NC}"
-    echo -e "  Скрипт обновления: ${CYAN}$UPDATE_SCRIPT${NC}"
-    echo -e "  Файл логов:        ${CYAN}$LOG_FILE${NC}"
-    echo
-    echo -e "${YELLOW}Примечания:${NC}"
-    echo "  • При обновлении сохраняются существующие конфигурационные файлы"
-    echo "  • Логи обновлений записываются в $LOG_FILE"
-    echo "  • Для просмотра логов используйте: tail -f $LOG_FILE"
-  
-    if [ "$auto_reboot" = "yes" ]; then
-      echo "  • Система будет автоматически перезагружена через 2 минуты после обновления (при необходимости)"
-    fi
-    echo
-}
-
-# Отключение автоматического обновления
-disable_auto_update() {
-    print_step "Отключение автоматического обновления..."
-    
-  local files_removed=0
-    
-    # Удаление cron задачи
-    if [ -f "$CRON_FILE" ]; then
-        rm -f "$CRON_FILE"
-        log "INFO" "Удалена задача cron: $CRON_FILE"
-    files_removed=$((files_removed + 1))
-    fi
-    
-    # Удаление конфигурации
-    if [ -f "$CONFIG_FILE" ]; then
-        rm -f "$CONFIG_FILE"
-     log "INFO" "Удален конфигурационный файл: $CONFIG_FILE"
-        files_removed=$((files_removed + 1))
-    fi
-    
-    # Удаление скрипта обновления
-    if [ -f "$UPDATE_SCRIPT" ]; then
-        rm -f "$UPDATE_SCRIPT"
-        log "INFO" "Удален скрипт обновления: $UPDATE_SCRIPT"
-        files_removed=$((files_removed + 1))
- fi
-
-    # Удаление конфигурации apt
-    if [ -f /etc/apt/apt.conf.d/99auto-update ]; then
-    rm -f /etc/apt/apt.conf.d/99auto-update
-      log "INFO" "Удалена конфигурация apt"
-        files_removed=$((files_removed + 1))
-    fi
-    
-    if [ $files_removed -gt 0 ]; then
-  log "INFO" "Автоматическое обновление отключено"
-        print_success "Автоматическое обновление отключено"
-        
- echo
-        read -p "Удалить файл логов ($LOG_FILE)? [y/N]: " delete_logs
-        if [[ "$delete_logs" =~ ^[Yy]$ ]]; then
-     rm -f "$LOG_FILE"
-   log "INFO" "Файл логов удален"
-    print_success "Файл логов удален"
-        else
-            print_step "Файл логов сохранен для просмотра"
-        fi
-    else
-        print_step "Автоматическое обновление не было настроено"
-    fi
-}
-
-# Просмотр логов
-view_logs() {
-  print_header "Просмотр логов обновлений"
-
-    if [ ! -f "$LOG_FILE" ]; then
-        print_error "Файл логов не найден: $LOG_FILE"
-        return 1
-    fi
-    
-    local log_size=$(du -h "$LOG_FILE" 2>/dev/null | cut -f1)
-    local log_lines=$(wc -l < "$LOG_FILE" 2>/dev/null || echo "0")
-    
-    echo -e "${CYAN}Информация о файле логов:${NC}"
-    echo -e "  Путь:    ${BLUE}$LOG_FILE${NC}"
-    echo -e "  Размер:  ${BLUE}$log_size${NC}"
-    echo -e "  Строк:   ${BLUE}$log_lines${NC}"
-    echo
-    
-    echo -e "${YELLOW}Выберите действие:${NC}"
-  echo "1. Показать последние 50 строк"
-echo "2. Показать последние 100 строк"
-    echo "3. Показать весь лог"
-  echo "4. Показать логи последнего обновления"
-    echo "5. Отслеживать лог в реальном времени (tail -f)"
-    echo "0. Назад"
-    echo
-    
- read -p "Выберите действие [0-5]: " choice
-  
-    case "$choice" in
-        1)
-    echo
-       echo -e "${CYAN}=== Последние 50 строк ===${NC}"
-     tail -n 50 "$LOG_FILE"
- ;;
-        2)
-     echo
-echo -e "${CYAN}=== Последние 100 строк ===${NC}"
-   tail -n 100 "$LOG_FILE"
-      ;;
-      3)
-    echo
-            echo -e "${CYAN}=== Весь лог ===${NC}"
-            less "$LOG_FILE"
-         ;;
-        4)
-            echo
-   echo -e "${CYAN}=== Логи последнего обновления ===${NC}"
-          # Ищем последний блок обновления
-          tac "$LOG_FILE" | sed -n '/======================================/,/======================================/p' | tac
-            ;;
-        5)
-   echo
-    echo -e "${CYAN}=== Отслеживание лога (Ctrl+C для выхода) ===${NC}"
-    tail -f "$LOG_FILE"
-    ;;
-        0)
-     return 0
-     ;;
-        *)
-   print_error "Неверный выбор"
-     ;;
-    esac
-}
-
-# Запуск обновления вручную
-run_manual_update() {
-    print_header "Запуск обновления вручную"
-    
-if [ ! -f "$UPDATE_SCRIPT" ]; then
-  print_error "Скрипт обновления не найден. Сначала настройте автоматическое обновление."
-        return 1
-  fi
-    
-    echo -e "${YELLOW}? Внимание!${NC}"
-    echo "Будет запущен процесс обновления системы."
- echo "Это может занять продолжительное время."
-    echo
-    
-    read -p "Продолжить? [y/N]: " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        log "INFO" "Ручное обновление отменено пользователем"
-        print_step "Обновление отменено"
-        return 0
-    fi
-    
-    print_step "Запуск обновления..."
-    log "INFO" "Запущено ручное обновление системы"
-    
-    # Запуск скрипта обновления
-    if bash "$UPDATE_SCRIPT"; then
-        print_success "Обновление завершено"
-        
-      # Показываем хвост лога
-      echo
-        echo -e "${CYAN}=== Последние строки лога ===${NC}"
-        tail -n 20 "$LOG_FILE"
-    else
-        print_error "Ошибка при выполнении обновления"
-        log "ERROR" "Ошибка при выполнении ручного обновления"
-        
-        # Показываем хвост лога с ошибками
-  echo
-   echo -e "${RED}=== Ошибки в логе ===${NC}"
-        tail -n 30 "$LOG_FILE" | grep -i "error\|failed\|ошибка" || tail -n 30 "$LOG_FILE"
-    fi
-}
-
-# Изменение настроек
-modify_settings() {
-    print_header "Изменение настроек"
-    
-    if ! check_auto_update_status; then
-        print_error "Автоматическое обновление не настроено"
-        return 1
-    fi
-    
-    echo -e "${YELLOW}Текущие настройки:${NC}"
-    echo "----------------------------------------"
-    show_current_settings
-    echo "----------------------------------------"
-    echo
-    
-    echo -e "${YELLOW}Выберите параметр для изменения:${NC}"
-    echo "1. Изменить график обновлений"
-    echo "2. Изменить время обновления"
-    echo "3. Изменить настройку автоперезагрузки"
-    echo "0. Назад"
-    echo
-    
-    read -p "Выберите действие [0-3]: " choice
-    
-    case "$choice" in
-        1)
-        # Читаем текущую конфигурацию
-  local current_auto_reboot=$(get_config_value "AUTO_REBOOT" "no")
-            local current_update_time=$(get_config_value "UPDATE_TIME" "03:00")
-            
-            # Повторяем процесс выбора графика
-        echo
-            echo -e "${YELLOW}=== Новый график обновлений ===${NC}"
-         echo "1. Еженедельно (каждое воскресенье)"
-        echo "2. Раз в две недели (1-го и 15-го числа)"
-    echo "3. Ежемесячно (1-го числа каждого месяца)"
-  echo "4. Ежедневно (для тестирования)"
- echo
-            
-            local new_schedule_type=""
-   local new_schedule_name=""
-            
-            while true; do
-   read -p "Выберите новый график [1-4]: " sched_choice
-       
-      case "$sched_choice" in
-         1) new_schedule_type="weekly"; new_schedule_name="Еженедельно"; break ;;
-        2) new_schedule_type="biweekly"; new_schedule_name="Раз в две недели"; break ;;
-      3) new_schedule_type="monthly"; new_schedule_name="Ежемесячно"; break ;;
-      4) new_schedule_type="daily"; new_schedule_name="Ежедневно"; break ;;
-        *) print_error "Неверный выбор" ;;
-    esac
-            done
-            
-        # Обновляем конфигурацию
-  sed -i "s/^UPDATE_SCHEDULE=.*/UPDATE_SCHEDULE=$new_schedule_name/" "$CONFIG_FILE"
-       sed -i "s/^SCHEDULE_TYPE=.*/SCHEDULE_TYPE=$new_schedule_type/" "$CONFIG_FILE"
-   
-            # Пересоздаем cron
-            setup_cron_schedule "$new_schedule_type" "$current_update_time" > /dev/null
-     
-            log "INFO" "График обновлений изменен на: $new_schedule_name"
-            print_success "График обновлений изменен"
-            ;;
-     
-        2)
-      echo
-  echo -e "${YELLOW}=== Новое время обновления ===${NC}"
-   echo "Текущее время: $(get_config_value "UPDATE_TIME" "03:00")"
-          echo
- 
-            local new_time=""
-            while true; do
-     read -p "Введите новое время (ЧЧ:ММ): " new_time
-          
-        if [[ "$new_time" =~ ^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-         break
-      else
-    print_error "Неверный формат. Используйте ЧЧ:ММ"
-  fi
-            done
-
-            # Обновляем конфигурацию
-            sed -i "s/^UPDATE_TIME=.*/UPDATE_TIME=$new_time/" "$CONFIG_FILE"
-         
-         # Пересоздаем cron
-       local current_schedule_type=$(get_config_value "SCHEDULE_TYPE" "weekly")
-        setup_cron_schedule "$current_schedule_type" "$new_time" > /dev/null
-            
-   log "INFO" "Время обновления изменено на: $new_time"
-            print_success "Время обновления изменено"
-    ;;
-    
-      3)
-         local current_reboot=$(get_config_value "AUTO_REBOOT" "no")
-            local new_reboot=""
-  
-     echo
-            echo -e "${YELLOW}=== Настройка автоперезагрузки ===${NC}"
-            echo "Текущее значение: $([ "$current_reboot" = "yes" ] && echo "Включена" || echo "Отключена")"
-   echo
-    
-       if [ "$current_reboot" = "yes" ]; then
-         read -p "Отключить автоматическую перезагрузку? [y/N]: " disable
-             if [[ "$disable" =~ ^[Yy]$ ]]; then
- new_reboot="no"
-         else
-     new_reboot="yes"
-    fi
-else
-      read -p "Включить автоматическую перезагрузку? [y/N]: " enable
-    if [[ "$enable" =~ ^[Yy]$ ]]; then
-      new_reboot="yes"
- else
-          new_reboot="no"
-           fi
-            fi
-         
-            # Обновляем конфигурацию
-     sed -i "s/^AUTO_REBOOT=.*/AUTO_REBOOT=$new_reboot/" "$CONFIG_FILE"
-      
-    # Пересоздаем скрипт обновления
-  create_update_script "$new_reboot"
-            
-log "INFO" "Автоперезагрузка $([ "$new_reboot" = "yes" ] && echo "включена" || echo "отключена")"
-      print_success "Настройка автоперезагрузки обновлена"
-          ;;
-      
-   0)
-      return 0
-            ;;
-        
-        *)
-    print_error "Неверный выбор"
-    ;;
-    esac
-}
-
-# Главное меню
-manage_auto_update() {
-    check_root
-    
-    while true; do
-        print_header "Автоматическое обновление VPS"
-        
-  echo -e "${CYAN}Текущее состояние:${NC}"
-      echo "----------------------------------------"
-        show_current_settings
-      echo "----------------------------------------"
-        echo
-     
-        echo -e "${YELLOW}Доступные действия:${NC}"
-        
- if check_auto_update_status; then
-      echo "1. Изменить настройки"
- echo "2. Просмотреть логи обновлений"
-            echo "3. Запустить обновление вручную"
-            echo "4. Отключить автоматическое обновление"
-        else
-            echo "1. Включить автоматическое обновление"
-  fi
-      
-        echo "0. Вернуться в главное меню"
-      echo
-  
-     read -p "Выберите действие: " choice
-        echo
-        
-    if check_auto_update_status; then
-      case $choice in
-            0) return 0 ;;
-            1) modify_settings ;;
-       2) view_logs ;;
-    3) run_manual_update ;;
-        4) disable_auto_update ;;
-     *) print_error "Неверный выбор" ;;
-  esac
-   else
-   case $choice in
-              0) return 0 ;;
-                1) enable_auto_update ;;
-    *) print_error "Неверный выбор" ;;
-  esac
-        fi
-  
-        echo
-        read -p "Нажмите Enter для продолжения..."
+        echo; pause_menu
     done
 }
 
-# Главная функция
-main() {
-    print_header "АВТООБНОВЛЕНИЕ VPS v1.0.0"
-    manage_auto_update
-}
-
-# Запуск главной функции
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main_menu "$@"; fi
