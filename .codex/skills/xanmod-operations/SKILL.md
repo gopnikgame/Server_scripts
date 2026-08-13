@@ -35,6 +35,8 @@ When editing `install_xanmod.sh`:
 - Add shell syntax checks and fixture-based tests for OS, psABI, package selection, and failure paths.
 - Mark behavior requiring a live VM or bare-metal test explicitly.
 
+For this repository's Xray/VLESS RAW(TCP) servers, prefer the documented `VLESS TCP Stable` profile: BBR on a running XanMod kernel, `fq`, `tcp_mtu_probing=1`, syncookies, non-decreasing connection backlogs, and RAM-scaled TCP autotuning ceilings. Do not add global keepalive, TIME_WAIT reuse, short FIN timeouts, ECN, TCP Fast Open, busy polling, or per-socket default buffer increases without measurements from the target workload.
+
 ## Safety boundaries
 
 - Treat kernel install, repository changes, sysctl writes, bootloader updates, service changes, package removal, and reboot as mutations requiring clear authorization.

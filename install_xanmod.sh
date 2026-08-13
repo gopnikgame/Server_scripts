@@ -1,836 +1,508 @@
-
 #!/bin/bash
 
-# Version: 1.3.1
-# Author: gopnikgame
-# Created: 2025-02-15 18:03:59 UTC
-# Last Modified: 2025-07-22 14:00:00 UTC
-# Description: XanMod kernel installation script with BBR3 optimization
+# Version: 2.0.0
+# Description: Interactive XanMod installer for VLESS TCP servers
 # Repository: https://github.com/gopnikgame/Server_scripts
 # License: MIT
 
-set -euo pipefail
+set -Eeuo pipefail
 
-# Константы
-readonly SCRIPT_VERSION="1.3.1"
-readonly SCRIPT_AUTHOR="gopnikgame"
-readonly STATE_FILE="/var/tmp/xanmod_install_state"
-readonly LOG_FILE="/var/log/xanmod_install.log"
-readonly SYSCTL_CONFIG="/etc/sysctl.d/99-xanmod-bbr.conf"
-readonly SCRIPT_PATH="/usr/local/sbin/xanmod_install"
-readonly SERVICE_NAME="xanmod-install-continue"
-readonly CURRENT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
-readonly CURRENT_USER=$(whoami)
+readonly SCRIPT_VERSION="2.0.0"
+readonly LOG_FILE="${XANMOD_LOG_FILE:-/var/log/xanmod_install.log}"
+readonly STATE_FILE="${XANMOD_STATE_FILE:-/var/lib/server-scripts/xanmod.state}"
+readonly SYSCTL_CONFIG="${XANMOD_SYSCTL_CONFIG:-/etc/sysctl.d/99-xanmod-vless-tcp.conf}"
+readonly APT_PROXY_CONFIG="${XANMOD_APT_PROXY_CONFIG:-/etc/apt/apt.conf.d/99xanmod-proxy}"
+readonly KEYRING_FILE="${XANMOD_KEYRING_FILE:-/etc/apt/keyrings/xanmod-archive-keyring.gpg}"
+readonly SOURCE_FILE="${XANMOD_SOURCE_FILE:-/etc/apt/sources.list.d/xanmod-release.list}"
+readonly BACKUP_DIR="${XANMOD_BACKUP_DIR:-/var/backups/server-scripts/xanmod}"
+readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
+readonly XANMOD_REPO_URL="http://deb.xanmod.org"
+readonly SUPPORTED_CODENAMES="bookworm trixie forky sid noble plucky questing resolute stonking faye gigi wilma xia zara zena"
 
-# Адрес прокси (задаётся в configure_proxy, используется во всех сетевых операциях)
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+
 PROXY_ADDR=""
+SELECTED_PACKAGE=""
+OS_ID="unknown"
+OS_NAME="unknown"
+OS_CODENAME="unknown"
+PSABI_LEVEL="unknown"
+RAM_MB=0
+ROOT_FREE_MB=0
+BOOT_FREE_MB=0
+BOOTLOADER="unknown"
+SECURE_BOOT="unknown"
+DKMS_STATUS="not-installed"
 
-# Функция логирования
-log() {
-    echo -e "\033[1;34m[$(date '+%Y-%m-%d %H:%M:%S')]\033[0m - $1" | tee -a "$LOG_FILE"
+init_runtime() {
+    umask 077
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 600 "$LOG_FILE"
 }
 
-# Функция вывода заголовка
-print_header() {
-    echo -e "\n\033[1;32m=== $1 ===\033[0m\n" | tee -a "$LOG_FILE"
-}
+log() { printf '%b[%s]%b %s\n' "$BLUE" "$(date '+%F %T')" "$NC" "$*" | tee -a "$LOG_FILE"; }
+success() { printf '%b[OK]%b %s\n' "$GREEN" "$NC" "$*" | tee -a "$LOG_FILE"; }
+warn() { printf '%b[ВНИМАНИЕ]%b %s\n' "$YELLOW" "$NC" "$*" | tee -a "$LOG_FILE"; }
+error() { printf '%b[ОШИБКА]%b %s\n' "$RED" "$NC" "$*" | tee -a "$LOG_FILE" >&2; }
+header() { printf '\n%b=== %s ===%b\n\n' "$GREEN" "$*" "$NC"; }
+pause() { read -rp "Нажмите Enter, чтобы продолжить..." _; }
+confirm() { local answer; read -rp "$1 [y/N]: " answer; [[ "$answer" =~ ^[Yy]$ ]]; }
 
-# Функция вывода ошибки
-log_error() {
-    echo -e "\033[1;31m[ОШИБКА] - $1\033[0m" | tee -a "$LOG_FILE"
-}
-
-# Очистка настроек прокси (вызывается автоматически при выходе)
-cleanup_proxy() {
-    if [ -f /etc/apt/apt.conf.d/99xanmod-proxy ]; then
-        rm -f /etc/apt/apt.conf.d/99xanmod-proxy
-        log "Настройки прокси для apt удалены"
-    fi
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy 2>/dev/null || true
-}
-
-# Проверка доступности репозитория и настройка прокси при необходимости
-configure_proxy() {
-    log "Проверка доступности репозитория XanMod..."
-
-    # Быстрая проверка прямого доступа к репозиторию (таймаут 8 сек)
-    if curl -sfI --connect-timeout 8 http://deb.xanmod.org &>/dev/null; then
-        log "✓ Репозиторий deb.xanmod.org доступен напрямую"
-        return 0
-    fi
-
-    log "⚠ Репозиторий deb.xanmod.org недоступен напрямую"
-    echo -e "\n\033[1;33m=== Настройка прокси ===\033[0m"
-    echo -e "Репозиторий \033[1;36mdeb.xanmod.org\033[0m недоступен напрямую."
-    echo -e "Возможная причина: региональная блокировка (Cloudflare CDN)."
-    echo
-    echo -e "Поддерживаемые форматы HTTP-прокси:"
-    echo -e "  \033[1;36mБез авторизации:\033[0m http://host:port"
-    echo -e "  \033[1;36mС авторизацией:\033[0m  http://user:pass@host:port"
-    echo -e "  \033[1;36mHTTPS прокси:\033[0m    https://host:port"
-    echo -e "\n\033[1;33mПримечание:\033[0m SOCKS5 не поддерживается apt напрямую."
-    echo -e "Для SOCKS5 используйте локальный HTTP-to-SOCKS5 конвертер"
-    echo -e "(например: \033[1;36mssh -D 1080 user@server\033[0m + Privoxy/polipo)."
-    echo
-
-    read -rp $'\033[1;33mВведите адрес прокси (или Enter для продолжения без прокси): \033[0m' proxy_input
-
-    if [ -z "$proxy_input" ]; then
-        log "Прокси не настроен. Продолжение без прокси."
-        return 0
-    fi
-
-    PROXY_ADDR="$proxy_input"
-
-    # Применяем переменные окружения (используются wget, curl, и другими утилитами)
-    export http_proxy="$PROXY_ADDR"
-    export https_proxy="$PROXY_ADDR"
-    export HTTP_PROXY="$PROXY_ADDR"
-    export HTTPS_PROXY="$PROXY_ADDR"
-    export no_proxy="localhost,127.0.0.1,::1"
-
-    # Настраиваем прокси для apt (файл будет удалён cleanup_proxy при выходе)
-    cat > /etc/apt/apt.conf.d/99xanmod-proxy << PROXYEOF
-Acquire::http::Proxy "$PROXY_ADDR";
-Acquire::https::Proxy "$PROXY_ADDR";
-PROXYEOF
-
-    log "✓ Прокси настроен: $PROXY_ADDR"
-
-    # Проверяем доступность репозитория через прокси
-    if curl -sfI --proxy "$PROXY_ADDR" --connect-timeout 10 http://deb.xanmod.org &>/dev/null; then
-        log "✓ Репозиторий доступен через прокси"
-    else
-        log "⚠ Репозиторий недоступен и через прокси. Установка продолжится, возможны ошибки."
+require_root() {
+    if (( EUID != 0 )); then
+        error "Запустите скрипт с правами root: sudo ./install_xanmod.sh"
+        return 1
     fi
 }
 
-# Проверка прав root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "Этот скрипт должен быть запущен с правами root"
-        exit 1
+read_os_release() {
+    if [[ ! -r /etc/os-release ]]; then
+        error "/etc/os-release не найден"
+        return 1
     fi
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID}"
+    OS_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-unknown}}"
 }
 
-# Проверка наличия XanMod
-check_xanmod() {
-    if uname -r | grep -q "xanmod"; then
-        local current_kernel
-        current_kernel=$(uname -r)
-        log "Обнаружено установленное ядро XanMod: $current_kernel"
-        
-        if [ -f "$STATE_FILE" ]; then
-            log "Найден файл состояния установки. Продолжаем настройку..."
-            configure_bbr
-            remove_startup_service
-            rm -f "$STATE_FILE"
-            print_header "Установка успешно завершена!"
-            echo -e "\nДля проверки работы BBR3 используйте команды:"
-            echo -e "\033[1;36msysctl net.ipv4.tcp_congestion_control\033[0m"
-            echo -e "\033[1;36msysctl net.core.default_qdisc\033[0m\n"
-            exit 0
-        else
-            echo -e "\n\033[1;33mВнимание: Ядро XanMod уже установлено.\033[0m"
-            read -rp $'Хотите переустановить? [y/N]: ' answer
-            case $answer in
-                [Yy]* ) 
-                    log "Пользователь выбрал переустановку"
-                    return 0
-                    ;;
-                * )
-                    log "Установка отменена пользователем"
-                    exit 0
-                    ;;
-            esac
-        fi
-    fi
+codename_supported() {
+    local codename="${1:-}"
+    [[ " $SUPPORTED_CODENAMES " == *" $codename "* ]]
 }
 
-# Проверка операционной системы
-check_os() {
-    print_header "Проверка системы"
-    
-    # Сначала проверяем XanMod
-    check_xanmod
-    
-    if [ ! -f /etc/os-release ]; then
-        log_error "Файл /etc/os-release не найден"
-        exit 1
-    fi
-    
-    local os_id
-    local os_name
-    
-    os_id=$(grep -E "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
-    os_name=$(grep -E "^PRETTY_NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
-    
-    case "$os_id" in
-        debian|ubuntu)
-            log "✓ Обнаружена поддерживаемая ОС: $os_name"
-            ;;
-        *)
-            log_error "Операционная система $os_name не поддерживается"
-            log_error "Поддерживаются только Debian и Ubuntu"
-            exit 1
-            ;;
-    esac
-    
-    if ! command -v lsb_release &> /dev/null; then
-        log_error "Команда 'lsb_release' не найдена. Установите пакет 'lsb-release'."
-        exit 1
-    fi
-
-    if [ "$(uname -m)" != "x86_64" ]; then
-        log_error "Поддерживается только архитектура x86_64"
-        exit 1
-    fi
-    
-    log "✓ Архитектура системы: $(uname -m)"
+cpu_has_flags() {
+    local flags=" $1 " required
+    shift
+    for required in "$@"; do
+        [[ "$flags" == *" $required "* ]] || return 1
+    done
 }
 
-# Проверка интернет-соединения
-check_internet() {
-    log "Проверка подключения к интернету..."
-    if ! ping -c1 -W3 google.com &>/dev/null; then
-        log_error "Нет подключения к интернету"
-        exit 1
+detect_psabi_from_flags() {
+    local flags="$1"
+    local level="x64v1"
+    if cpu_has_flags "$flags" sse4_2 ssse3 popcnt cx16; then
+        level="x64v2"
     fi
-    log "✓ Подключение к интернету активно"
+    if [[ "$level" == "x64v2" ]] && cpu_has_flags "$flags" avx2 bmi1 bmi2 f16c fma lzcnt movbe; then
+        level="x64v3"
+    fi
+    printf '%s\n' "$level"
 }
 
-# Проверка свободного места
-check_disk_space() {
-    local required_space=2000
-    local available_space
-    available_space=$(df --output=avail -m / | awk 'NR==2 {print $1}')
-    
-    log "Проверка свободного места..."
-    if (( available_space < required_space )); then
-        log_error "Недостаточно свободного места (минимум 2 ГБ)"
-        exit 1
-    fi
-    log "✓ Доступно $(( available_space / 1024 )) ГБ свободного места"
-}
-
-# Определение PSABI версии
-# Логика основана на официальном скрипте: https://dl.xanmod.org/check_x86-64_psabi.sh
-get_psabi_version() {
-    local level=1
+detect_psabi() {
     local flags
-    flags=$(grep -m1 flags /proc/cpuinfo | cut -d ':' -f 2)
-
-    _has_flag() {
-        echo "$flags" | grep -qw "$1"
-    }
-
-    # x86-64-v2: SSE4.2, SSSE3, POPCNT, CMPXCHG16B
-    if _has_flag sse4_2 && _has_flag ssse3 && _has_flag popcnt && _has_flag cx16; then
-        level=2
-    fi
-
-    # x86-64-v3: AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE
-    if [ $level -eq 2 ] && _has_flag avx2 && _has_flag bmi1 && _has_flag bmi2 && _has_flag f16c && _has_flag fma && _has_flag lzcnt && _has_flag movbe; then
-        level=3
-    fi
-
-    printf 'x64v%d' "$level"
+    flags=$(awk -F: '/^flags/{print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+    PSABI_LEVEL=$(detect_psabi_from_flags "$flags")
 }
 
-# Функция для проверки доступности пакета
-check_package_availability() {
-    local package_name="$1"
-    log "Проверка доступности пакета: $package_name..."
-    
-    # Проверка доступности метапакетов
-    if apt-cache show "$package_name" 2>/dev/null | grep -q "Package: $package_name"; then
-        log "✓ Пакет $package_name доступен в репозитории"
-        echo "$package_name"
-        return 0
+detect_bootloader() {
+    if command -v bootctl >/dev/null 2>&1 && bootctl is-installed >/dev/null 2>&1; then
+        BOOTLOADER="systemd-boot"
+    elif command -v update-grub >/dev/null 2>&1 || [[ -d /boot/grub ]]; then
+        BOOTLOADER="grub"
+    else
+        BOOTLOADER="unknown"
     fi
-    
-    log "Пакет $package_name не найден, проверяем альтернативы..."
-    
-    # Проверка альтернативных версий
-    if [[ "$package_name" == *"-x64v4" ]]; then
-        local alt_package="${package_name/x64v4/x64v3}"
-        log "Проверка наличия альтернативного пакета: $alt_package"
-        
-        if apt-cache show "$alt_package" 2>/dev/null | grep -q "Package: $alt_package"; then
-            log "✓ Найден альтернативный пакет: $alt_package"
-            echo "$alt_package"
-            return 0
-        fi
-    elif [[ "$package_name" == *"-x64v3" ]]; then
-        local alt_package="${package_name/x64v3/x64v2}"
-        log "Проверка наличия альтернативного пакета: $alt_package"
-        
-        if apt-cache show "$alt_package" 2>/dev/null | grep -q "Package: $alt_package"; then
-            log "✓ Найден альтернативный пакет: $alt_package"
-            echo "$alt_package"
-            return 0
-        fi
-    fi
-    
-    # Поиск метапакетов по списку
-    log "Поиск доступных метапакетов..."
-    local available_metapackages=$(apt-cache search "^linux-xanmod-" | grep -v "headers\|image" | awk '{print $1}')
-    
-    if [[ -n "$available_metapackages" ]]; then
-        # Выбираем наиболее подходящий метапакет
-        for meta in $available_metapackages; do
-            if [[ "$meta" == *"$package_name"* || "$package_name" == *"$meta"* ]]; then
-                log "✓ Найден подходящий метапакет: $meta"
-                echo "$meta"
-                return 0
-            fi
-        done
-        
-        # Если не нашли конкретного совпадения, используем первый доступный
-        local first_meta=$(echo "$available_metapackages" | head -n1)
-        log "✓ Используем доступный метапакет: $first_meta"
-        echo "$first_meta"
-        return 0
-    fi
-    
-    # Если не нашли метапакеты, ищем конкретные пакеты ядра
-    log "Поиск конкретных версий ядра..."
-    local psabi_version="x64v3"
-    
-    if [[ "$package_name" =~ x64v([1-4]) ]]; then
-        psabi_version=$(echo "$package_name" | grep -o "x64v[1-4]")
-    fi
-    
-    # Поиск наиболее свежей версии ядра с заданным PSABI
-    local latest_kernel=$(apt-cache search "linux-image-[0-9].*-${psabi_version}-xanmod[0-9]" | sort -Vr | head -n1 | awk '{print $1}')
-    
-    if [[ -n "$latest_kernel" ]]; then
-        log "✓ Найдена конкретная версия ядра: $latest_kernel"
-        echo "$latest_kernel"
-        return 0
-    fi
-    
-    # Попробуем найти хоть какую-то версию XanMod
-    local any_xanmod=$(apt-cache search "linux-image.*xanmod" | sort -Vr | head -n1 | awk '{print $1}')
-    
-    if [[ -n "$any_xanmod" ]]; then
-        log "✓ Найдена версия XanMod: $any_xanmod"
-        echo "$any_xanmod"
-        return 0
-    fi
-    
-    # Вывод доступных пакетов в лог
-    log "Доступные пакеты XanMod:"
-    apt-cache search "xanmod" | tee -a "$LOG_FILE"
-    
-    # Если ничего не найдено, возвращаем пустую строку с ошибкой
-    log_error "Не найдено подходящих пакетов XanMod"
-    echo ""
 }
 
-# Выбор версии ядра
-select_kernel_version() {
-    local PSABI_VERSION
-    PSABI_VERSION=$(get_psabi_version)
-    
-    {
-        print_header "Выбор версии ядра XanMod"
-        
-        echo -e "\n\033[1;33mℹ️  Информация о системе:\033[0m"
-        echo "----------------------------------------"
-        echo -e "Текущая дата:      \033[1;36m$CURRENT_DATE\033[0m"
-        echo -e "Пользователь:      \033[1;36m$CURRENT_USER\033[0m"
-        echo -e "Текущее ядро:      \033[1;36m$(uname -r)\033[0m"
-        echo -e "Оптимизация CPU:    \033[1;32m${PSABI_VERSION}\033[0m"
-        echo -e "BBR3 поддержка:     \033[1;32mВключена\033[0m"
-        echo "----------------------------------------"
-        
-        echo -e "\n\033[1;33m📦 Доступные версии ядра:\033[0m"
-        echo "----------------------------------------"
-        echo -e "\033[1;36m1)\033[0m linux-xanmod         \033[1;32m(Рекомендуется, MAIN)\033[0m"
-        echo -e "\033[1;36m2)\033[0m linux-xanmod-edge    \033[1;33m(Тестовая, EDGE)\033[0m"
-        echo -e "\033[1;36m3)\033[0m linux-xanmod-rt      \033[1;35m(Real-time, RT)\033[0m"
-        echo -e "\033[1;36m4)\033[0m linux-xanmod-lts     \033[1;34m(Долгосрочная поддержка, LTS)\033[0m"
-        echo "----------------------------------------"
+detect_secure_boot() {
+    if command -v mokutil >/dev/null 2>&1; then
+        SECURE_BOOT=$(mokutil --sb-state 2>/dev/null | head -n1 || echo unknown)
+    elif [[ -d /sys/firmware/efi ]]; then
+        SECURE_BOOT="unknown (mokutil отсутствует)"
+    else
+        SECURE_BOOT="not-applicable (BIOS)"
+    fi
+}
 
-        if [[ "${PSABI_VERSION}" == "x64v1" ]]; then
-            echo -e "\033[1;31m⚠ Ваш CPU поддерживает только x64v1. Доступна только LTS версия.\033[0m"
-        fi
-    } > /dev/tty
+detect_dkms() {
+    if command -v dkms >/dev/null 2>&1; then
+        DKMS_STATUS=$(dkms status 2>/dev/null || true)
+        [[ -n "$DKMS_STATUS" ]] || DKMS_STATUS="установлен, модулей нет"
+    fi
+}
 
-    read -rp $'\033[1;33mВыберите версию ядра (1-4, по умолчанию 1): \033[0m' choice < /dev/tty
+free_mb_for() {
+    df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
 
-    local KERNEL_PACKAGE
-    case $choice in
-        2) KERNEL_PACKAGE="linux-xanmod-edge";;
-        3) KERNEL_PACKAGE="linux-xanmod-rt";;
-        4) KERNEL_PACKAGE="linux-xanmod-lts";;
-        *) KERNEL_PACKAGE="linux-xanmod";;
+collect_system_info() {
+    read_os_release || return 1
+    detect_psabi
+    detect_bootloader
+    detect_secure_boot
+    detect_dkms
+    RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    ROOT_FREE_MB=$(free_mb_for /)
+    BOOT_FREE_MB=$(free_mb_for /boot)
+    [[ -n "$BOOT_FREE_MB" ]] || BOOT_FREE_MB="$ROOT_FREE_MB"
+}
+
+show_system_report() {
+    collect_system_info || return 1
+    header "Диагностика системы"
+    printf 'ОС:                    %s\n' "$OS_NAME"
+    printf 'Codename:              %s\n' "$OS_CODENAME"
+    printf 'Архитектура:           %s\n' "$(uname -m)"
+    printf 'Текущее ядро:          %s\n' "$(uname -r)"
+    printf 'CPU psABI:             %s\n' "$PSABI_LEVEL"
+    printf 'Оперативная память:    %s МБ\n' "$RAM_MB"
+    printf 'Свободно в /:          %s МБ\n' "$ROOT_FREE_MB"
+    printf 'Свободно в /boot:      %s МБ\n' "$BOOT_FREE_MB"
+    printf 'Загрузчик:             %s\n' "$BOOTLOADER"
+    printf 'Secure Boot:           %s\n' "$SECURE_BOOT"
+    printf 'Виртуализация:         %s\n' "$(systemd-detect-virt 2>/dev/null || echo unknown)"
+    printf 'DKMS:                  %s\n' "$DKMS_STATUS"
+    if codename_supported "$OS_CODENAME"; then
+        success "Codename опубликован в текущем списке поддержки XanMod"
+    else
+        warn "Codename '$OS_CODENAME' отсутствует в списке поддержки XanMod"
+    fi
+    if [[ "$(uname -r)" == *xanmod* ]]; then
+        success "Сейчас загружено ядро XanMod"
+    else
+        warn "Сейчас загружено не XanMod-ядро"
+    fi
+}
+
+preflight_install() {
+    collect_system_info || return 1
+    [[ "$OS_ID" == debian || "$OS_ID" == ubuntu ]] || { error "Поддерживаются Debian и Ubuntu"; return 1; }
+    [[ "$(uname -m)" == x86_64 ]] || { error "Поддерживается только x86_64"; return 1; }
+    codename_supported "$OS_CODENAME" || { error "XanMod не публикует пакеты для '$OS_CODENAME'"; return 1; }
+    (( ROOT_FREE_MB >= 2048 )) || { error "В / требуется минимум 2 ГБ свободного места"; return 1; }
+    (( BOOT_FREE_MB >= 350 )) || { error "В /boot требуется минимум 350 МБ свободного места"; return 1; }
+    [[ "$BOOTLOADER" != unknown ]] || warn "Загрузчик не определён; установка возможна, но автоматическое обновление меню не гарантируется"
+    [[ "$SECURE_BOOT" != *enabled* && "$SECURE_BOOT" != *Enabled* ]] || { error "Secure Boot включён. Сначала подготовьте доверенную подпись ядра или отключите Secure Boot"; return 1; }
+    if [[ "$DKMS_STATUS" != "not-installed" && "$DKMS_STATUS" != "установлен, модулей нет" ]]; then
+        warn "Обнаружены DKMS-модули. Последнее XanMod-ядро может быть с ними несовместимо:"
+        printf '%s\n' "$DKMS_STATUS"
+        confirm "Продолжить после проверки списка DKMS?" || return 1
+    fi
+}
+
+cleanup_proxy() {
+    rm -f "$APT_PROXY_CONFIG"
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY 2>/dev/null || true
+    PROXY_ADDR=""
+}
+
+repo_reachable() {
+    curl -fsSI --connect-timeout 8 "$XANMOD_KEY_URL" >/dev/null 2>&1 &&
+        curl -fsSI --connect-timeout 8 "$XANMOD_REPO_URL" >/dev/null 2>&1
+}
+
+configure_proxy_interactive() {
+    header "Сеть и прокси"
+    if repo_reachable; then
+        success "Ресурсы XanMod доступны напрямую"
+        return 0
+    fi
+    warn "Ресурсы XanMod недоступны напрямую. ICMP/ping для решения не используется."
+    printf 'Введите HTTP/HTTPS-прокси. Полный адрес останется видимым для копирования.\n'
+    printf 'Пример: http://login:password@host:port\n\n'
+    read -rp "Прокси (Enter — отмена): " PROXY_ADDR
+    [[ -n "$PROXY_ADDR" ]] || return 1
+    [[ "$PROXY_ADDR" =~ ^https?://[^[:space:]]+$ ]] || { error "Ожидается URL http:// или https:// без пробелов"; return 1; }
+    case "$PROXY_ADDR" in
+        *\"*|*\\*) error "Кавычки и обратная косая черта в URL должны быть percent-encoded"; return 1 ;;
     esac
-
-    # x64v1 доступен только для LTS; для MAIN/EDGE/RT минимум x64v2
-    local psabi_for_package="${PSABI_VERSION}"
-    if [[ "${psabi_for_package}" == "x64v1" && "$KERNEL_PACKAGE" != "linux-xanmod-lts" ]]; then
-        log "⚠ x64v1 доступен только для LTS. Переключение на LTS."
-        echo -e "\033[1;31m⚠ x64v1 доступен только для LTS ядра. Автоматический выбор LTS.\033[0m" > /dev/tty
-        KERNEL_PACKAGE="linux-xanmod-lts"
-    fi
-
-    KERNEL_PACKAGE="${KERNEL_PACKAGE}-${psabi_for_package}"
-
-    printf "%s" "$KERNEL_PACKAGE"
+    export http_proxy="$PROXY_ADDR" https_proxy="$PROXY_ADDR"
+    export HTTP_PROXY="$PROXY_ADDR" HTTPS_PROXY="$PROXY_ADDR"
+    export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="$no_proxy"
+    mkdir -p "$(dirname "$APT_PROXY_CONFIG")"
+    printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$PROXY_ADDR" "$PROXY_ADDR" > "$APT_PROXY_CONFIG"
+    chmod 600 "$APT_PROXY_CONFIG"
+    printf '\n%bТекущий прокси: %s%b\n' "$CYAN" "$PROXY_ADDR" "$NC"
+    log "Пользователь настроил авторизованный прокси (полный адрес показан только в интерактивной консоли)"
+    repo_reachable || { error "Ресурсы XanMod недоступны и через указанный прокси"; return 1; }
+    success "Прокси работает"
 }
 
-# Установка ядра
-install_kernel() {
-    print_header "Установка ядра XanMod"
-    
-    # Создаем директории для ключей и репозиториев
-    mkdir -p /etc/apt/keyrings
-    mkdir -p /etc/apt/sources.list.d
-    
-    if [ ! -f "/etc/apt/keyrings/xanmod-archive-keyring.gpg" ]; then
-        log "Добавление репозитория XanMod..."
-        if ! wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -vo /etc/apt/keyrings/xanmod-archive-keyring.gpg; then
-            log_error "Ошибка при добавлении ключа"
-            exit 1
-        fi
-        
-        local codename
-        codename=$(lsb_release -sc)
-        log "Обнаружено кодовое имя дистрибутива: $codename"
-        if ! echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $codename main" | tee /etc/apt/sources.list.d/xanmod-release.list > /dev/null; then
-            log_error "Ошибка при добавлении репозитория"
-            exit 1
-        fi
-        
-        log "Обновление списка пакетов..."
-        if ! apt-get update; then
-            log_error "Ошибка при обновлении пакетов"
-            exit 1
-        fi
-        log "✓ Репозиторий XanMod успешно добавлен"
-    fi
-
-    # Проверяем доступные метапакеты XanMod
-    log "Проверка доступных пакетов XanMod..."
-    local available_packages=$(apt-cache search "^linux-xanmod-" | grep -v "headers\|image" | sort)
-    if [ -z "$available_packages" ]; then
-        log_error "Не найдены метапакеты XanMod. Проверка отдельных пакетов ядра..."
-        available_packages=$(apt-cache search "linux-image.*xanmod" | sort)
-        
-        if [ -z "$available_packages" ]; then
-            log_error "Не найдены пакеты ядра XanMod. Возможно, репозиторий недоступен или неправильно настроен."
-            log "Проверка доступности репозитория..."
-            curl -I http://deb.xanmod.org
-            exit 1
-        fi
-    fi
-    
-    log "Доступные пакеты XanMod:"
-    echo "$available_packages" | tee -a "$LOG_FILE"
-
-    # Выбор версии ядра
-    log "Выбор версии ядра..."
-    local KERNEL_PACKAGE
-    KERNEL_PACKAGE=$(select_kernel_version)
-    
-    if [ -z "$KERNEL_PACKAGE" ]; then
-        log_error "Ошибка: имя пакета пустое"
-        exit 1
-    fi
-
-    log "Выбран пакет: $KERNEL_PACKAGE"
-    
-    # Проверяем наличие выбранного пакета
-    if ! apt-cache show "$KERNEL_PACKAGE" >/dev/null 2>&1; then
-        log_error "Пакет $KERNEL_PACKAGE не найден в репозитории"
-        
-        # Проверка альтернативных версий
-        log "Поиск альтернативных версий..."
-        
-        # Сначала проверяем метапакеты без psABI суффикса
-        local base_package
-        if [[ "$KERNEL_PACKAGE" == *"-x64v"* ]]; then
-            base_package="${KERNEL_PACKAGE%-x64v*}"
-            log "Проверка базового пакета: $base_package"
-            
-            if apt-cache show "$base_package" >/dev/null 2>&1; then
-                log "✓ Найден базовый пакет: $base_package"
-                KERNEL_PACKAGE="$base_package"
-            fi
-        fi
-        
-        # Если и базовый пакет не найден, ищем другие версии psABI
-        if ! apt-cache show "$KERNEL_PACKAGE" >/dev/null 2>&1; then
-            local psabi_versions=("x64v3" "x64v2" "x64v1")
-            
-            for version in "${psabi_versions[@]}"; do
-                if [[ "$KERNEL_PACKAGE" == *"-x64v"* ]]; then
-                    local alt_package="${KERNEL_PACKAGE/-x64v[1-4]/-$version}"
-                    log "Проверка альтернативной версии: $alt_package"
-                    
-                    if apt-cache show "$alt_package" >/dev/null 2>&1; then
-                        log "✓ Найден альтернативный пакет: $alt_package"
-                        KERNEL_PACKAGE="$alt_package"
-                        break
-                    fi
-                fi
-            done
-        fi
-        
-        # Если все еще не найден пакет, ищем любой подходящий образ ядра
-        if ! apt-cache show "$KERNEL_PACKAGE" >/dev/null 2>&1; then
-            log "Поиск любого доступного ядра XanMod..."
-            local kernel_type
-            
-            if [[ "$KERNEL_PACKAGE" == *"edge"* ]]; then
-                kernel_type="edge"
-            elif [[ "$KERNEL_PACKAGE" == *"rt"* ]]; then
-                kernel_type="rt"
-            elif [[ "$KERNEL_PACKAGE" == *"lts"* ]]; then
-                kernel_type="lts"
-            else
-                kernel_type=""
-            fi
-            
-            # Ищем последнюю версию образа ядра
-            local latest_kernel
-            if [ -n "$kernel_type" ]; then
-                latest_kernel=$(apt-cache search "linux-image-.*-${kernel_type}-.*xanmod" | sort -Vr | head -n1 | awk '{print $1}')
-            else
-                latest_kernel=$(apt-cache search "linux-image-.*xanmod" | grep -v "edge\|rt\|lts" | sort -Vr | head -n1 | awk '{print $1}')
-            fi
-            
-            if [ -n "$latest_kernel" ]; then
-                log "✓ Найден образ ядра: $latest_kernel"
-                KERNEL_PACKAGE="$latest_kernel"
-            else
-                # Крайний случай - выводим список и предлагаем выбрать вручную
-                log_error "Не удалось автоматически выбрать пакет ядра"
-                echo -e "\n\033[1;33mДоступные пакеты XanMod:\033[0m"
-                apt-cache search "linux.*xanmod" | sort
-                
-                read -rp $'\033[1;33mВведите точное имя пакета для установки или нажмите Enter для выхода: \033[0m' manual_package
-                
-                if [ -n "$manual_package" ]; then
-                    KERNEL_PACKAGE="$manual_package"
-                    log "Выбран пакет вручную: $KERNEL_PACKAGE"
-                else
-                    log "Установка отменена пользователем"
-                    exit 1
-                fi
-            fi
-        fi
-    fi
-
-    log "Подготовка к установке пакета: $KERNEL_PACKAGE"
-    echo -e "\n\033[1;33mУстановка пакета: ${KERNEL_PACKAGE}\033[0m"
-    apt-get update -qq
-
-    # Определение типа загрузчика (BIOS / UEFI)
-    local grub_package=""
-    if [ -d /sys/firmware/efi ]; then
-        grub_package="grub-efi-amd64"
-        log "Обнаружена загрузка UEFI, будет использован $grub_package"
-    else
-        grub_package="grub-pc"
-        log "Обнаружена загрузка BIOS, будет использован $grub_package"
-    fi
-
-    # Настройка параметров загрузки для BBR3
-    log "Настройка параметров загрузки ядра..."
-    if ! grep -q "tcp_congestion_control=bbr" /etc/default/grub; then
-        cp /etc/default/grub /etc/default/grub.backup
-        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="tcp_congestion_control=bbr /' /etc/default/grub
-        log "✓ Параметры загрузки обновлены"
-    fi
-
-    # Установка с явным указанием конфигурации GRUB
-    export DEBIAN_FRONTEND=noninteractive
-
-    # Определяем тип пакета и устанавливаем соответствующие пакеты
-    if [[ "$KERNEL_PACKAGE" =~ ^linux-xanmod ]]; then
-        # Установка метапакета
-        log "Установка метапакета XanMod: $KERNEL_PACKAGE"
-        if ! apt-get install -y "$KERNEL_PACKAGE" "$grub_package"; then
-            log_error "Ошибка при установке метапакета. Попытка установки конкретных пакетов..."
-            
-            # Если метапакет не устанавливается, попробуем найти конкретную версию ядра
-            local kernel_version
-            local kernel_prefix
-            
-            if [[ "$KERNEL_PACKAGE" == *"-edge"* ]]; then
-                kernel_prefix="edge"
-            elif [[ "$KERNEL_PACKAGE" == *"-rt"* ]]; then
-                kernel_prefix="rt"
-            elif [[ "$KERNEL_PACKAGE" == *"-lts"* ]]; then
-                kernel_prefix="lts"
-            else
-                kernel_prefix=""
-            fi
-            
-            local psabi_version="x64v3"
-            if [[ "$KERNEL_PACKAGE" == *"-x64v"* ]]; then
-                psabi_version=$(echo "$KERNEL_PACKAGE" | grep -o "x64v[1-4]")
-            fi
-            
-            # Ищем подходящий образ ядра
-            local image_package
-            if [ -n "$kernel_prefix" ]; then
-                image_package=$(apt-cache search "linux-image-.*-${psabi_version}-.*${kernel_prefix}.*xanmod" | sort -Vr | head -n1 | awk '{print $1}')
-            else
-                image_package=$(apt-cache search "linux-image-.*-${psabi_version}-.*xanmod" | grep -v "edge\|rt\|lts" | sort -Vr | head -n1 | awk '{print $1}')
-            fi
-            
-            if [ -n "$image_package" ]; then
-                local headers_package="${image_package/image/headers}"
-                log "Установка образа ядра: $image_package и заголовков: $headers_package"
-                
-                if ! apt-get install -y "$image_package" "$headers_package" "$grub_package"; then
-                    log_error "Ошибка при установке ядра"
-                    exit 1
-                fi
-            else
-                log_error "Не удалось найти подходящие пакеты ядра"
-                exit 1
-            fi
-        fi
-    else
-        # Установка конкретного образа ядра
-        log "Установка конкретного образа ядра: $KERNEL_PACKAGE"
-        local headers_package="${KERNEL_PACKAGE/linux-image/linux-headers}"
-
-        if apt-cache show "$headers_package" >/dev/null 2>&1; then
-            log "Установка ядра и заголовков: $KERNEL_PACKAGE, $headers_package"
-            if ! apt-get install -y "$KERNEL_PACKAGE" "$headers_package" "$grub_package"; then
-                log_error "Ошибка при установке ядра"
-                exit 1
-            fi
-        else
-            log "Заголовки не найдены, установка только образа ядра: $KERNEL_PACKAGE"
-            if ! apt-get install -y "$KERNEL_PACKAGE" "$grub_package"; then
-                log_error "Ошибка при установке ядра"
-                exit 1
-            fi
-        fi
-    fi
-
-    log "Обновление конфигурации GRUB..."
-    if ! update-grub; then
-        log_error "Ошибка при обновлении GRUB"
-        exit 1
-    fi
-
-    echo "kernel_installed" > "$STATE_FILE"
-    log "✓ Ядро успешно установлено"
-    
-    # Показываем информацию о установленном ядре
-    log "Установленные пакеты ядра XanMod:"
-    dpkg -l | grep xanmod | tee -a "$LOG_FILE"
+backup_file() {
+    local source="$1" label="$2" stamp target
+    [[ -e "$source" ]] || return 0
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    mkdir -p "$BACKUP_DIR"
+    target="$BACKUP_DIR/${label}.${stamp}"
+    cp -a "$source" "$target"
+    printf '%s\n' "$target"
 }
 
-# Настройка BBR
-configure_bbr() {
-    print_header "Настройка TCP BBR3"
-    
-    if ! uname -r | grep -q "xanmod"; then
-        log_error "Не обнаружено ядро XanMod"
-        exit 1
+setup_repository() {
+    header "Настройка репозитория XanMod"
+    command -v curl >/dev/null 2>&1 || apt-get install -y curl
+    command -v gpg >/dev/null 2>&1 || apt-get install -y gnupg
+    mkdir -p "$(dirname "$KEYRING_FILE")" "$(dirname "$SOURCE_FILE")"
+    backup_file "$KEYRING_FILE" keyring >/dev/null
+    backup_file "$SOURCE_FILE" source-list >/dev/null
+    local temporary_key
+    temporary_key=$(mktemp)
+    curl -fsSL "$XANMOD_KEY_URL" -o "$temporary_key"
+    gpg --batch --yes --dearmor -o "$KEYRING_FILE" "$temporary_key"
+    rm -f "$temporary_key"
+    chmod 644 "$KEYRING_FILE"
+    printf 'deb [signed-by=%s] %s %s main\n' "$KEYRING_FILE" "$XANMOD_REPO_URL" "$OS_CODENAME" > "$SOURCE_FILE"
+    chmod 644 "$SOURCE_FILE"
+    apt-get update
+    success "Ключ и source list XanMod настроены"
+}
+
+available_metapackages() {
+    apt-cache pkgnames | grep -E '^linux-xanmod(-(lts|rt|edge))?-x64v[123]$' | sort -u || true
+}
+
+recommended_package() {
+    local psabi="$1" packages="$2" candidate
+    for candidate in "linux-xanmod-lts-$psabi" "linux-xanmod-$psabi" "linux-xanmod-rt-$psabi"; do
+        grep -qx "$candidate" <<<"$packages" && { printf '%s\n' "$candidate"; return 0; }
+    done
+    if [[ "$psabi" == x64v1 ]]; then
+        grep -x 'linux-xanmod-lts-x64v1' <<<"$packages" || true
     fi
-    
-    log "Применение оптимизированных сетевых настроек..."
-    
-    local temp_config
-    temp_config=$(mktemp)
-    
-    cat > "$temp_config" <<EOF
-# BBR3 core settings
-net.core.default_qdisc=fq_pie
+}
+
+select_package_interactive() {
+    local packages recommended choice selected index=1
+    packages=$(available_metapackages)
+    [[ -n "$packages" ]] || { error "APT не вернул метапакеты XanMod"; return 1; }
+    recommended=$(recommended_package "$PSABI_LEVEL" "$packages")
+    [[ -n "$recommended" ]] || { error "Нет пакета, совместимого с $PSABI_LEVEL"; return 1; }
+    header "Выбор ядра"
+    printf 'Для стабильного VLESS TCP сервера рекомендуется LTS: %b%s%b\n\n' "$GREEN" "$recommended" "$NC"
+    local compatible=()
+    while IFS= read -r selected; do
+        [[ "$selected" == *"-$PSABI_LEVEL" ]] || continue
+        compatible+=("$selected")
+        printf '%d) %s%s\n' "$index" "$selected" "$([[ "$selected" == "$recommended" ]] && echo ' (рекомендуется)')"
+        index=$((index + 1))
+    done <<<"$packages"
+    printf '0) Отмена\n'
+    read -rp "Выберите пакет [по умолчанию рекомендуемый]: " choice
+    if [[ -z "$choice" ]]; then
+        SELECTED_PACKAGE="$recommended"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#compatible[@]} )); then
+        SELECTED_PACKAGE="${compatible[choice-1]}"
+    else
+        return 1
+    fi
+}
+
+save_state() {
+    mkdir -p "$(dirname "$STATE_FILE")"
+    printf 'installed_package=%q\nprevious_kernel=%q\ninstalled_at=%q\n' "$1" "$(uname -r)" "$(date -Is)" > "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+}
+
+install_kernel_interactive() {
+    require_root || return 1
+    preflight_install || return 1
+    configure_proxy_interactive || return 1
+    setup_repository || return 1
+    local package
+    SELECTED_PACKAGE=""
+    select_package_interactive || { warn "Установка отменена"; return 0; }
+    package="$SELECTED_PACKAGE"
+    header "Подтверждение установки"
+    printf 'Пакет:              %s\n' "$package"
+    printf 'Текущее ядро:       %s (будет сохранено)\n' "$(uname -r)"
+    printf 'Загрузчик:          %s\n' "$BOOTLOADER"
+    printf 'Профиль сети:       будет применён только после загрузки XanMod\n'
+    confirm "Установить выбранное ядро?" || return 0
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+    if [[ "$BOOTLOADER" == grub ]] && command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    fi
+    save_state "$package"
+    success "Пакет установлен. Старое ядро не удалено."
+    warn "Профиль VLESS TCP Stable ещё не применён: сначала нужно загрузить новое ядро."
+    if confirm "Перезагрузить сервер сейчас? Убедитесь, что доступна консоль провайдера"; then
+        cleanup_proxy
+        reboot
+    else
+        printf 'Перезагрузите сервер позже и снова откройте это интерактивное меню.\n'
+    fi
+}
+
+buffer_limit_for_ram() {
+    local ram_mb="$1"
+    if (( ram_mb < 1024 )); then printf '%s\n' 8388608
+    elif (( ram_mb < 4096 )); then printf '%s\n' 16777216
+    else printf '%s\n' 33554432
+    fi
+}
+
+max_current_or() {
+    local key="$1" wanted="$2" current
+    current=$(sysctl -n "$key" 2>/dev/null || echo 0)
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    (( current > wanted )) && printf '%s\n' "$current" || printf '%s\n' "$wanted"
+}
+
+render_vless_profile() {
+    local ram_mb="$1" buffer somax synbacklog
+    buffer=$(buffer_limit_for_ram "$ram_mb")
+    somax=$(max_current_or net.core.somaxconn 8192)
+    synbacklog=$(max_current_or net.ipv4.tcp_max_syn_backlog 8192)
+    cat <<EOF
+# Server_scripts: VLESS TCP Stable
+# Generated: $(date -Is)
+# Designed for Xray/VLESS RAW(TCP) with TLS or REALITY.
+net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-
-# TCP optimizations for XanMod
-net.ipv4.tcp_ecn=1
-net.ipv4.tcp_timestamps=1
-net.ipv4.tcp_sack=1
-
-# Buffer settings optimized for 10Gbit+ networks
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.rmem_default=1048576
-net.core.wmem_default=1048576
-net.core.optmem_max=65536
-net.ipv4.tcp_rmem=4096 1048576 67108864
-net.ipv4.tcp_wmem=4096 1048576 67108864
-
-# BBR3 specific optimizations
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_window_scaling=1
-net.ipv4.tcp_notsent_lowat=131072
-net.core.netdev_max_backlog=16384
-net.core.somaxconn=8192
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_max_tw_buckets=2000000
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.tcp_fin_timeout=10
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.tcp_keepalive_time=60
-net.ipv4.tcp_keepalive_intvl=10
-net.ipv4.tcp_keepalive_probes=6
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_syncookies=1
-
-# Additional XanMod optimizations
-net.core.busy_read=50
-net.core.busy_poll=50
-net.ipv4.tcp_max_orphans=16384
+net.core.somaxconn=$somax
+net.ipv4.tcp_max_syn_backlog=$synbacklog
+net.core.rmem_max=$buffer
+net.core.wmem_max=$buffer
+net.ipv4.tcp_rmem=4096 131072 $buffer
+net.ipv4.tcp_wmem=4096 16384 $buffer
 EOF
+}
 
-    if ! sysctl -p "$temp_config" &>>"$LOG_FILE"; then
-        log_error "Ошибка применения настроек sysctl. Подробности:"
-        cat "$LOG_FILE"
-        rm -f "$temp_config"
+validate_profile_keys() {
+    local file="$1" key missing=0
+    while IFS='=' read -r key _; do
+        [[ "$key" =~ ^[[:space:]]*# || -z "${key// }" ]] && continue
+        key="${key//[[:space:]]/}"
+        sysctl -n "$key" >/dev/null 2>&1 || { error "Ядро не поддерживает sysctl: $key"; missing=1; }
+    done < "$file"
+    (( missing == 0 ))
+}
+
+apply_vless_profile() {
+    require_root || return 1
+    collect_system_info || return 1
+    [[ "$(uname -r)" == *xanmod* ]] || { error "Сначала загрузите установленное ядро XanMod"; return 1; }
+    sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr || { error "Загруженное ядро не предоставляет BBR"; return 1; }
+    local temporary backup=""
+    temporary=$(mktemp)
+    render_vless_profile "$RAM_MB" > "$temporary"
+    validate_profile_keys "$temporary" || { rm -f "$temporary"; return 1; }
+    header "Профиль VLESS TCP Stable"
+    cat "$temporary"
+    printf '\nПрофиль не меняет keepalive, TIME_WAIT, FIN timeout, ECN, busy_poll или глобальные default-буферы.\n'
+    confirm "Применить этот профиль?" || { rm -f "$temporary"; return 0; }
+    [[ ! -e "$SYSCTL_CONFIG" ]] || backup=$(backup_file "$SYSCTL_CONFIG" sysctl)
+    install -m 0644 "$temporary" "$SYSCTL_CONFIG"
+    rm -f "$temporary"
+    if ! sysctl --system >>"$LOG_FILE" 2>&1; then
+        error "Применение sysctl завершилось ошибкой"
+        [[ -z "$backup" ]] || cp -a "$backup" "$SYSCTL_CONFIG"
+        return 1
+    fi
+    success "Профиль применён"
+    verify_configuration
+}
+
+verify_configuration() {
+    header "Проверка XanMod и VLESS TCP"
+    local kernel cc qdisc available profile="нет"
+    kernel=$(uname -r)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)
+    [[ -f "$SYSCTL_CONFIG" ]] && profile="да"
+    printf 'Ядро:                %s\n' "$kernel"
+    printf 'Доступные CC:         %s\n' "$available"
+    printf 'Активный CC:          %s\n' "$cc"
+    printf 'Qdisc по умолчанию:   %s\n' "$qdisc"
+    printf 'Профиль установлен:   %s\n' "$profile"
+    printf 'Xray:                 %s\n' "$(systemctl is-active xray 2>/dev/null || echo не-найден)"
+    printf 'Failed services:      %s\n' "$(systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'Socket summary:\n'; ss -s 2>/dev/null || true
+    if [[ "$kernel" == *xanmod* && "$cc" == bbr && "$qdisc" == fq ]]; then
+        success "XanMod + BBR + fq активны"
+    else
+        warn "Конфигурация ещё не соответствует профилю VLESS TCP Stable"
+    fi
+}
+
+rollback_profile() {
+    require_root || return 1
+    header "Откат сетевого профиля"
+    [[ -f "$SYSCTL_CONFIG" ]] || { warn "Активный профиль не найден"; return 0; }
+    local backups selected
+    backups=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'sysctl.*' 2>/dev/null | sort -r || true)
+    if [[ -n "$backups" ]]; then
+        selected=$(head -n1 <<<"$backups")
+        printf 'Будет восстановлена копия: %s\n' "$selected"
+        confirm "Восстановить предыдущий профиль?" || return 0
+        cp -a "$selected" "$SYSCTL_CONFIG"
+    else
+        warn "Предыдущей копии нет. Файл профиля будет удалён, затем применятся остальные sysctl-файлы."
+        confirm "Удалить профиль VLESS TCP Stable?" || return 0
+        rm -f "$SYSCTL_CONFIG"
+    fi
+    sysctl --system >>"$LOG_FILE" 2>&1
+    success "Сетевой профиль откачен. Пакеты ядра не удалялись."
+}
+
+show_proxy() {
+    header "Текущий временный прокси"
+    if [[ -n "$PROXY_ADDR" ]]; then
+        printf '%b%s%b\n' "$CYAN" "$PROXY_ADDR" "$NC"
+    elif [[ -r "$APT_PROXY_CONFIG" ]]; then
+        cat "$APT_PROXY_CONFIG"
+    else
+        printf 'Прокси установщика не настроен.\n'
+    fi
+}
+
+main_menu() {
+    while true; do
+        clear
+        printf '%b=== XanMod для VLESS TCP, версия %s ===%b\n\n' "$BLUE" "$SCRIPT_VERSION" "$NC"
+        printf '1) Диагностика системы (без изменений)\n'
+        printf '2) Установить или обновить XanMod\n'
+        printf '3) Применить профиль VLESS TCP Stable\n'
+        printf '4) Проверить ядро, BBR, fq и Xray\n'
+        printf '5) Откатить сетевой профиль\n'
+        printf '6) Показать текущий прокси\n'
+        printf '7) Показать план аварийного возврата к старому ядру\n'
+        printf '0) Выход\n\n'
+        local choice
+        read -rp "Выберите действие: " choice
+        case "$choice" in
+            1) show_system_report || true; pause ;;
+            2) install_kernel_interactive || true; pause ;;
+            3) apply_vless_profile || true; pause ;;
+            4) verify_configuration || true; pause ;;
+            5) rollback_profile || true; pause ;;
+            6) show_proxy || true; pause ;;
+            7)
+                header "Аварийный возврат к старому ядру"
+                printf '1. Откройте консоль провайдера до перезагрузки.\n'
+                printf '2. В меню загрузчика выберите сохранённое предыдущее ядро.\n'
+                printf '3. После загрузки подтвердите его командой: uname -r\n'
+                printf '4. Только затем удаляйте выбранный XanMod-метапакет через apt.\n'
+                printf 'Установщик намеренно не удаляет ядра автоматически.\n'
+                if [[ -r "$STATE_FILE" ]]; then
+                    printf '\nСостояние последней установки:\n'
+                    cat "$STATE_FILE"
+                fi
+                pause
+                ;;
+            0) break ;;
+            *) warn "Неизвестный пункт"; sleep 1 ;;
+        esac
+    done
+}
+
+on_exit() { cleanup_proxy; }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    if (( EUID != 0 )); then
+        printf 'Запустите скрипт с правами root: sudo ./install_xanmod.sh\n' >&2
         exit 1
     fi
-
-    if ! cp "$temp_config" "$SYSCTL_CONFIG"; then
-        log_error "Ошибка при копировании конфигурации"
-        rm -f "$temp_config"
-        exit 1
-    fi
-
-    rm -f "$temp_config"
-    log "✓ Сетевые настройки применены"
-
-    # Проверка BBR (в XanMod tcp_bbr встроен в ядро [built-in], не модуль)
-    if lsmod | grep -q "^tcp_bbr "; then
-        log "✓ BBR загружен как модуль"
-    elif sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw "bbr"; then
-        log "✓ BBR встроен в ядро (built-in)"
-    else
-        log "Попытка загрузки модуля tcp_bbr..."
-        modprobe tcp_bbr 2>/dev/null || true
-    fi
-
-    # Проверка версии BBR
-    local bbr_version="unknown"
-    if modinfo tcp_bbr &>/dev/null; then
-        bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep "^version:" | awk '{print $2}')
-    elif [ -f /sys/module/tcp_bbr/version ]; then
-        bbr_version=$(cat /sys/module/tcp_bbr/version)
-    fi
-
-    # Проверяем доступность bbr в списке алгоритмов
-    local available_cc
-    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
-    if echo "$available_cc" | grep -qw "bbr"; then
-        log "✓ BBR доступен в списке алгоритмов: $available_cc"
-    else
-        log_error "BBR не найден в доступных алгоритмах: $available_cc"
-    fi
-    
-    echo -e "\n\033[1;33mВажно: BBR3 будет активирован после перезагрузки\033[0m"
-    check_bbr_version
-}
-
-# Проверка версии BBR
-check_bbr_version() {
-    log "Проверка конфигурации сети..."
-    
-    local current_cc
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    local current_qdisc
-    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
-    local bbr_version
-    if modinfo tcp_bbr &>/dev/null; then
-        bbr_version=$(modinfo tcp_bbr 2>/dev/null | grep "^version:" | awk '{print $2}' || echo "unknown")
-    elif [ -f /sys/module/tcp_bbr/version ]; then
-        bbr_version=$(cat /sys/module/tcp_bbr/version)
-    else
-        bbr_version="built-in"
-    fi
-    
-    echo -e "\n\033[1;33mТекущая конфигурация:\033[0m"
-    echo "----------------------------------------"
-    echo -e "Алгоритм управления:    \033[1;32m$current_cc\033[0m"
-    echo -e "Планировщик очереди:    \033[1;32m$current_qdisc\033[0m"
-    echo -e "Версия BBR:             \033[1;32m$bbr_version\033[0m"
-    echo -e "ECN статус:             \033[1;32m$(sysctl -n net.ipv4.tcp_ecn)\033[0m"
-    echo "----------------------------------------"
-
-    if [[ "$current_cc" == "bbr" && "$current_qdisc" == "fq_pie" ]]; then
-        echo -e "\n\033[1;32m✓ BBR правильно настроен и активен\033[0m"
-    else
-        echo -e "\n\033[1;31m⚠ BBR настроен некорректно\033[0m"
-        echo -e "\nОжидаемые значения:"
-        echo -e "- tcp_congestion_control: bbr (текущее: $current_cc)"
-        echo -e "- default_qdisc: fq_pie (текущее: $current_qdisc)"
-    fi
-}
-
-# Создание сервиса автозапуска
-create_startup_service() {
-    log "Создание сервиса автозапуска..."
-    
-    cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=XanMod Kernel Installation Continuation
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=$SCRIPT_PATH --continue
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    cp "$0" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}.service"
-    log "✓ Сервис автозапуска создан"
-}
-
-# Удаление сервиса автозапуска
-remove_startup_service() {
-    log "Очистка системы..."
-    systemctl disable "${SERVICE_NAME}.service"
-    rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-    systemctl daemon-reload
-    rm -f "$SCRIPT_PATH"
-    log "✓ Временные файлы удалены"
-}
-
-# Главная функция
-main() {
-    # Гарантируем очистку настроек прокси при любом выходе из скрипта
-    trap cleanup_proxy EXIT
-
-    if [[ "${1:-}" == "--continue" ]] && [ -f "$STATE_FILE" ]; then
-        configure_bbr
-        remove_startup_service
-        rm -f "$STATE_FILE"
-        print_header "Установка успешно завершена!"
-        echo -e "\nДля проверки работы BBR3 используйте команды:"
-        echo -e "\033[1;36msysctl net.ipv4.tcp_congestion_control\033[0m"
-        echo -e "\033[1;36msysctl net.core.default_qdisc\033[0m\n"
-        exit 0
-    fi
-
-    print_header "Установка XanMod Kernel v$SCRIPT_VERSION"
-    check_root
-    check_os
-    check_internet
-    check_disk_space
-    configure_proxy
-    install_kernel
-    create_startup_service
-    echo -e "\n\033[1;33mУстановка завершена. Система будет перезагружена через 5 секунд...\033[0m"
-    sleep 5
-    reboot
-}
-
-# Запуск скрипта
-main "$@"
+    init_runtime
+    trap on_exit EXIT
+    main_menu
+fi
