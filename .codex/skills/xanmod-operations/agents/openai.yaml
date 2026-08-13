@@ -1,0 +1,4 @@
+interface:
+  display_name: "XanMod Operations"
+  short_description: "Безопасная установка и диагностика XanMod"
+  default_prompt: "Используй $xanmod-operations для проверки системы и безопасного плана установки или диагностики XanMod."
