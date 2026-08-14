@@ -1,9 +1,12 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+# Official references checked 2026-08-14:
+# https://documentation.ubuntu.com/server/how-to/security/firewalls/
+# https://documentation.ubuntu.com/server/how-to/security/openssh-server/
+set -Eeuo pipefail
 
 # Метаданные скрипта
-SCRIPT_VERSION="1.1.1"
-SCRIPT_DATE="2025-05-14 14:30:00"
+SCRIPT_VERSION="1.2.0"
+SCRIPT_DATE="2026-08-14"
 SCRIPT_AUTHOR="gopnikgame"
 
 # Цветовые коды
@@ -37,14 +40,14 @@ print_error() {
     echo -e "${RED}✘${NC} $1"
 }
 
+print_warning() {
+    echo -e "${YELLOW}!${NC} $1"
+}
+
 # Константы
 BACKUP_DIR="/root/config_backup_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/system_setup.log"
 MIN_FREE_SPACE_KB=2097152  # 2GB в килобайтах
-
-# Создаем директорию для резервных копий и логов
-mkdir -p "$BACKUP_DIR"
-mkdir -p "$(dirname "$LOG_FILE")"
 
 # Функция логирования с цветным выводом
 log() {
@@ -61,20 +64,48 @@ log() {
     echo "${timestamp} [${level}] $*" >> "$LOG_FILE"
 }
 
-# Функция отката изменений
+ROLLBACK_ACTIVE=0
+ROLLBACK_KIND=""
+UFW_WAS_ACTIVE=0
+AUTHORIZED_KEYS_EXISTED=0
+
+# Восстановление выполняется только для текущей транзакции UFW или SSH.
 rollback() {
-    log "ERROR" "Произошла ошибка. Выполняется откат изменений..."
-    exit 1
+    local rc="${1:-1}"
+    trap - ERR
+    (( ROLLBACK_ACTIVE == 1 )) || return "$rc"
+    log "ERROR" "Ошибка во время настройки ${ROLLBACK_KIND}. Восстанавливаем исходную конфигурацию."
+    case "$ROLLBACK_KIND" in
+        ufw)
+            if [[ -d "$BACKUP_DIR/ufw" ]]; then
+                rm -rf /etc/ufw
+                cp -a "$BACKUP_DIR/ufw" /etc/ufw
+                if (( UFW_WAS_ACTIVE == 1 )); then ufw --force enable >/dev/null 2>&1 || true; else ufw --force disable >/dev/null 2>&1 || true; fi
+            fi
+            ;;
+        ssh)
+            if [[ -f "$BACKUP_DIR/sshd_config" ]]; then cp -a "$BACKUP_DIR/sshd_config" /etc/ssh/sshd_config; fi
+            if [[ -f "$BACKUP_DIR/00-server-scripts.conf" ]]; then
+                cp -a "$BACKUP_DIR/00-server-scripts.conf" /etc/ssh/sshd_config.d/00-server-scripts.conf
+            else
+                rm -f /etc/ssh/sshd_config.d/00-server-scripts.conf
+            fi
+            if (( AUTHORIZED_KEYS_EXISTED == 1 )) && [[ -f "$BACKUP_DIR/authorized_keys" ]]; then
+                cp -a "$BACKUP_DIR/authorized_keys" /root/.ssh/authorized_keys
+            else
+                rm -f /root/.ssh/authorized_keys
+            fi
+            sshd -t >/dev/null 2>&1 && systemctl reload ssh >/dev/null 2>&1 || true
+            ;;
+    esac
+    ROLLBACK_ACTIVE=0
+    ROLLBACK_KIND=""
+    trap transaction_error ERR
+    return "$rc"
 }
 
-# Установка обработчика ошибок
-trap rollback ERR
-
-# Проверка root прав
-if [ "$EUID" -ne 0 ]; then 
-    log "ERROR" "Этот скрипт должен быть запущен с правами root"
-    exit 1
-fi
+transaction_error() { local rc=$?; rollback "$rc"; exit "$rc"; }
+trap transaction_error ERR
 
 # Проверка свободного места на диске
 check_free_space() {
@@ -85,8 +116,15 @@ check_free_space() {
     fi
 }
 
-log "INFO" "Проверка свободного места на диске..."
-check_free_space
+initialize_script() {
+    if (( EUID != 0 )); then
+        echo "Этот скрипт должен быть запущен с правами root" >&2
+        exit 1
+    fi
+    mkdir -p "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
+    log "INFO" "Проверка свободного места на диске..."
+    check_free_space
+}
 
 # Создание резервных копий
 backup_file() {
@@ -104,6 +142,61 @@ backup_file() {
     else
         log "WARNING" "Файл не найден для резервного копирования: $src"
     fi
+}
+
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+
+valid_ip_or_cidr() {
+    local value="$1" address prefix octet
+    local -a octets
+    [[ -n "$value" && "$value" != *[[:space:]]* ]] || return 1
+    if [[ "$value" == *:* ]]; then
+        command -v python3 >/dev/null 2>&1 || return 1
+        python3 -c 'import ipaddress,sys; ipaddress.ip_network(sys.argv[1], strict=False)' "$value" >/dev/null 2>&1
+        return
+    fi
+    address="${value%%/*}"
+    if [[ "$value" == */* ]]; then
+        prefix="${value##*/}"
+        [[ "$prefix" =~ ^[0-9]+$ ]] && (( 10#$prefix <= 32 )) || return 1
+    fi
+    IFS=. read -r -a octets <<< "$address"
+    ((${#octets[@]} == 4)) || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+detect_ssh_port() {
+    local port connection="${SSH_CONNECTION:-}"
+    if [[ -n "$connection" ]]; then
+        port="${connection##* }"
+        if valid_port "$port"; then printf '%s\n' "$port"; return 0; fi
+    fi
+    port="$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')"
+    valid_port "${port:-}" && printf '%s\n' "$port" || printf '22\n'
+}
+
+current_ssh_client_ip() {
+    local connection="${SSH_CONNECTION:-}" client
+    [[ -n "$connection" ]] || return 0
+    client="${connection%% *}"
+    valid_ip_or_cidr "$client" && printf '%s\n' "$client" || true
+}
+
+render_ssh_dropin() {
+    cat <<'EOF'
+# Managed by Server_scripts ubuntu_pre_install.sh
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+X11Forwarding no
+MaxAuthTries 3
+AllowAgentForwarding no
+AllowTcpForwarding no
+LoginGraceTime 30
+EOF
 }
 
 # Установка зависимостей и обновление системы
@@ -284,249 +377,88 @@ install_dnscrypt() {
 
 # Настройка файрволла (UFW)
 configure_firewall() {
-    log "INFO" "Настройка UFW..."
+    command -v ufw >/dev/null || { print_error "UFW не установлен."; return 1; }
+    command -v sshd >/dev/null || { print_error "sshd не найден: сначала установите OpenSSH Server."; return 1; }
 
-    # Сброс существующих правил UFW
-    log "INFO" "Сброс существующих правил UFW..."
-    print_step "Сброс правил UFW..."
-    
-    # Проверка статуса UFW
-    if ufw status | grep -q "Status: active"; then
-        log "INFO" "UFW активен, отключаем перед сбросом правил..."
-        yes | ufw disable >/dev/null 2>&1
-    fi
-    
-    # Сброс всех правил
-    log "INFO" "Сброс правил UFW до настроек по умолчанию..."
-    ufw --force reset >/dev/null 2>&1
-    print_success "Правила UFW сброшены"
-    
-    # Создание резервной копии конфигурации UFW
-    if [ -d "/etc/ufw" ]; then
-        for ufw_config in /etc/ufw/user*.rules; do
-            if [ -f "$ufw_config" ]; then
-                backup_file "$ufw_config"
-            fi
+    local ssh_port client_ip open_http restrict_ssh custom_ports restrict_custom_ports value port ip
+    local -a ssh_allowed_ips=() custom_port_list=() custom_ip_list=()
+    ssh_port="$(detect_ssh_port)"
+    client_ip="$(current_ssh_client_ip)"
+    print_header "Безопасный план UFW"
+    echo -e "${CYAN}Фактический порт sshd:${NC} $ssh_port"
+    [[ -z "$client_ip" ]] || echo -e "${CYAN}Адрес текущей SSH-сессии:${NC} $client_ip"
+    read -r -p "Открыть HTTP 80/tcp? [y/N]: " open_http
+    read -r -p "Ограничить SSH списком IP/CIDR? [y/N]: " restrict_ssh
+    if [[ "$restrict_ssh" =~ ^[Yy]$ ]]; then
+        [[ -z "$client_ip" ]] || { ssh_allowed_ips+=("$client_ip"); print_step "Текущий адрес $client_ip добавлен автоматически."; }
+        while true; do
+            read -r -p "IP или CIDR для SSH (Enter — закончить): " value
+            [[ -n "$value" ]] || break
+            if valid_ip_or_cidr "$value"; then ssh_allowed_ips+=("$value"); else print_error "Некорректный IP/CIDR."; fi
         done
-        if [ -f "/etc/ufw/ufw.conf" ]; then
-            backup_file "/etc/ufw/ufw.conf"
+        ((${#ssh_allowed_ips[@]} > 0)) || { print_error "Нельзя включить ограничение SSH с пустым списком."; return 1; }
+    fi
+
+    read -r -p "Добавить пользовательские TCP-порты? [y/N]: " custom_ports
+    if [[ "$custom_ports" =~ ^[Yy]$ ]]; then
+        while true; do
+            read -r -p "TCP-порт (Enter — закончить): " value
+            [[ -n "$value" ]] || break
+            if valid_port "$value"; then custom_port_list+=("$value"); else print_error "Порт должен быть 1–65535."; fi
+        done
+        if ((${#custom_port_list[@]} > 0)); then
+            read -r -p "Ограничить эти порты списком IP/CIDR? [y/N]: " restrict_custom_ports
+            if [[ "$restrict_custom_ports" =~ ^[Yy]$ ]]; then
+                while true; do
+                    read -r -p "IP или CIDR (Enter — закончить): " value
+                    [[ -n "$value" ]] || break
+                    if valid_ip_or_cidr "$value"; then custom_ip_list+=("$value"); else print_error "Некорректный IP/CIDR."; fi
+                done
+                ((${#custom_ip_list[@]} > 0)) || { print_error "Ограничение с пустым списком запрещено."; return 1; }
+            fi
         fi
     fi
 
-    # Блокировка IP-адресов из AS61280 (IPv4 и IPv6)
-    log "INFO" "Получение списка IP-адресов для блокировки (AS61280)..."
-    blocked_ips=$(whois -h whois.radb.net -- '-i origin AS61280' | grep -E '^route|^route6' | awk '{print $2}')
-    if [ -z "$blocked_ips" ]; then
-        log "WARNING" "Не удалось получить IP-адреса для блокировки."
-    else
-        log "INFO" "Блокировка IP-адресов из AS61280..."
-        for ip in $blocked_ips; do
-            ufw deny from "$ip" to any
-            log "INFO" "Заблокирован IP-адрес: $ip"
-        done
-    fi
+    echo; print_warning "Существующие правила будут заменены. Сначала создаётся полная копия /etc/ufw."
+    read -r -p "Применить показанный план? [y/N]: " value
+    [[ "$value" =~ ^[Yy]$ ]] || { print_step "Настройка отменена."; return 0; }
 
-    # Основные правила UFW
+    rm -rf "$BACKUP_DIR/ufw"
+    cp -a /etc/ufw "$BACKUP_DIR/ufw"
+    LC_ALL=C ufw status | grep -q '^Status: active' && UFW_WAS_ACTIVE=1 || UFW_WAS_ACTIVE=0
+    ROLLBACK_KIND=ufw; ROLLBACK_ACTIVE=1
+    ufw --force disable >/dev/null 2>&1 || true
+    ufw --force reset >/dev/null
     ufw default deny incoming
     ufw default allow outgoing
-    
-    # Порт 443 (HTTPS) открыт по умолчанию
     ufw allow 443/tcp
-    log "INFO" "Открыт порт 443 (HTTPS)"
-    
-    # Спрашиваем пользователя о порте 80 (HTTP)
-    echo -e "\n${YELLOW}=== Настройка порта 80 (HTTP) ===${NC}"
-    read -p "Открыть порт 80 (HTTP)? [y/n]: " open_http
-    if [[ "$open_http" =~ ^[Yy]$ ]]; then
-        ufw allow 80/tcp
-        log "INFO" "Открыт порт 80 (HTTP)"
-    else
-        log "INFO" "Порт 80 (HTTP) не будет открыт"
-    fi
-    
-    # Настройка порта SSH
-    echo -e "\n${YELLOW}=== Настройка порта SSH ===${NC}"
-    local ssh_port=22
-    read -p "Введите порт SSH [по умолчанию 22]: " custom_ssh_port
-    
-    # Проверка введенного порта
-    if [ -n "$custom_ssh_port" ]; then
-        if [[ "$custom_ssh_port" =~ ^[0-9]+$ ]] && [ "$custom_ssh_port" -ge 1 ] && [ "$custom_ssh_port" -le 65535 ]; then
-            ssh_port=$custom_ssh_port
-            log "INFO" "Установлен кастомный порт SSH: $ssh_port"
-        else
-            log "WARNING" "Некорректный порт. Используется порт по умолчанию: 22"
-            print_error "Некорректный порт. Используется порт 22"
-            ssh_port=22
-        fi
-    else
-        log "INFO" "Используется порт SSH по умолчанию: 22"
-    fi
-    
-    echo -e "${CYAN}Порт SSH:${NC} $ssh_port"
-    
-    # Настройка доступа к SSH
-    echo -e "\n${YELLOW}=== Настройка доступа к SSH (порт $ssh_port) ===${NC}"
-    read -p "Настроить SSH только для определенных IP-адресов? [y/n]: " restrict_ssh
+    if [[ "$open_http" =~ ^[Yy]$ ]]; then ufw allow 80/tcp; fi
     if [[ "$restrict_ssh" =~ ^[Yy]$ ]]; then
-        log "INFO" "Настройка доступа к SSH для определенных IP-адресов"
-        ssh_allowed_ips=()
-        
-        echo "Введите IP-адреса для доступа к SSH (оставьте поле пустым и нажмите Enter для завершения):"
-        while true; do
-            # Отображаем текущий список IP-адресов
-            if [ ${#ssh_allowed_ips[@]} -gt 0 ]; then
-                echo -e "${CYAN}Добавленные IP-адреса: ${ssh_allowed_ips[*]}${NC}"
-            fi
-            
-            read -p "IP-адрес для SSH: " ip_addr
-            
-            # Проверка, пустой ли ввод
-            if [ -z "$ip_addr" ]; then
-                if [ ${#ssh_allowed_ips[@]} -eq 0 ]; then
-                    # Список пуст, просто выходим
-                    log "INFO" "IP-адреса для SSH не указаны, порт $ssh_port будет открыт для всех"
-                    ufw allow $ssh_port/tcp
-                    break
-                else
-                    # Список не пуст, спрашиваем о завершении
-                    read -p "Вы закончили вводить IP-адреса? [y/n]: " done_adding
-                    if [[ "$done_adding" =~ ^[Yy]$ ]]; then
-                        break
-                    fi
-                fi
-            elif [[ "$ip_addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                # Базовая валидация IP-адреса
-                ssh_allowed_ips+=("$ip_addr")
-                log "INFO" "Добавлен IP-адрес для SSH: $ip_addr"
-            else
-                print_error "Некорректный формат IP-адреса"
-            fi
-        done
-        
-        # Применяем правила для SSH если есть IP-адреса
-        if [ ${#ssh_allowed_ips[@]} -gt 0 ]; then
-            log "INFO" "Настройка правил SSH для указанных IP-адресов (порт $ssh_port)"
-            for ip in "${ssh_allowed_ips[@]}"; do
-                ufw allow from "$ip" to any port $ssh_port proto tcp
-                log "INFO" "Разрешен доступ к SSH (порт $ssh_port) для IP: $ip"
-            done
-        fi
+        for ip in "${ssh_allowed_ips[@]}"; do ufw allow proto tcp from "$ip" to any port "$ssh_port"; done
     else
-        # Открываем SSH для всех
-        ufw allow $ssh_port/tcp
-        log "INFO" "Порт $ssh_port (SSH) открыт для всех"
+        ufw allow "$ssh_port/tcp"
     fi
-    
-    # Настройка пользовательских портов
-    echo -e "\n${YELLOW}=== Настройка пользовательских портов ===${NC}"
-    read -p "Настроить дополнительные порты? [y/n]: " custom_ports
-    if [[ "$custom_ports" =~ ^[Yy]$ ]]; then
-        log "INFO" "Настройка дополнительных портов"
-        custom_port_list=()
-        
-        echo "Введите номера портов для открытия (оставьте поле пустым и нажмите Enter для завершения):"
-        while true; do
-            # Отображаем текущий список портов
-            if [ ${#custom_port_list[@]} -gt 0 ]; then
-                echo -e "${CYAN}Добавленные порты: ${custom_port_list[*]}${NC}"
-            fi
-            
-            read -p "Номер порта: " port_num
-            
-            # Проверка, пустой ли ввод
-            if [ -z "$port_num" ]; then
-                if [ ${#custom_port_list[@]} -eq 0 ]; then
-                    # Список пуст, просто выходим
-                    log "INFO" "Дополнительные порты не указаны"
-                    break
-                else
-                    # Список не пуст, спрашиваем о завершении
-                    read -p "Вы закончили вводить порты? [y/n]: " done_ports
-                    if [[ "$done_ports" =~ ^[Yy]$ ]]; then
-                        break
-                    fi
-                fi
-            elif [[ "$port_num" =~ ^[0-9]+$ ]] && [ "$port_num" -ge 1 ] && [ "$port_num" -le 65535 ]; then
-                # Валидный номер порта
-                custom_port_list+=("$port_num")
-                log "INFO" "Добавлен порт: $port_num"
-            else
-                print_error "Некорректный номер порта (должен быть от 1 до 65535)"
-            fi
-        done
-        
-        # Если есть порты для настройки
-        if [ ${#custom_port_list[@]} -gt 0 ]; then
-            # Спрашиваем о настройке доступа по IP
-            echo -e "\n${YELLOW}Настройка доступа к пользовательским портам${NC}"
-            read -p "Ограничить доступ к пользовательским портам по IP? [y/n]: " restrict_custom_ports
-            
-            if [[ "$restrict_custom_ports" =~ ^[Yy]$ ]]; then
-                # Ограничение по IP
-                custom_ip_list=()
-                
-                echo "Введите IP-адреса для доступа к пользовательским портам (оставьте поле пустым для завершения):"
-                while true; do
-                    # Отображаем текущий список IP
-                    if [ ${#custom_ip_list[@]} -gt 0 ]; then
-                        echo -e "${CYAN}Добавленные IP-адреса: ${custom_ip_list[*]}${NC}"
-                    fi
-                    
-                    read -p "IP-адрес: " custom_ip
-                    
-                    # Проверка, пустой ли ввод
-                    if [ -z "$custom_ip" ]; then
-                        if [ ${#custom_ip_list[@]} -eq 0 ]; then
-                            # Список пуст, выходим и будем открывать порты для всех
-                            log "INFO" "IP-адреса для пользовательских портов не указаны, порты будут открыты для всех"
-                            for port in "${custom_port_list[@]}"; do
-                                ufw allow "$port/tcp"
-                                log "INFO" "Открыт порт $port/tcp для всех"
-                            done
-                            break
-                        else
-                            # Список не пуст, спрашиваем о завершении
-                            read -p "Вы закончили вводить IP-адреса? [y/n]: " done_ips
-                            if [[ "$done_ips" =~ ^[Yy]$ ]]; then
-                                # Применяем правила для каждого порта и IP
-                                for port in "${custom_port_list[@]}"; do
-                                    for ip in "${custom_ip_list[@]}"; do
-                                        ufw allow from "$ip" to any port "$port" proto tcp
-                                        log "INFO" "Разрешен доступ к порту $port/tcp для IP: $ip"
-                                    done
-                                done
-                                break
-                            fi
-                        fi
-                    elif [[ "$custom_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                        # Валидный IP
-                        custom_ip_list+=("$custom_ip")
-                        log "INFO" "Добавлен IP-адрес для пользовательских портов: $custom_ip"
-                    else
-                        print_error "Некорректный формат IP-адреса"
-                    fi
-                done
-            else
-                # Открываем порты для всех
-                for port in "${custom_port_list[@]}"; do
-                    ufw allow "$port/tcp"
-                    log "INFO" "Открыт порт $port/tcp для всех"
-                done
-            fi
+    for port in "${custom_port_list[@]}"; do
+        if ((${#custom_ip_list[@]} > 0)); then
+            for ip in "${custom_ip_list[@]}"; do ufw allow proto tcp from "$ip" to any port "$port"; done
+        else
+            ufw allow "$port/tcp"
         fi
-    fi
-
-    # Активация UFW
-    echo -e "\n${YELLOW}=== Активация файрволла UFW ===${NC}"
-    print_step "Активация UFW..."
-    yes | ufw enable
-    log "INFO" "UFW успешно настроен и активирован."
-    print_success "UFW успешно настроен."
-    
-    # Вывод статуса UFW
-    echo -e "\n${YELLOW}=== Текущие правила UFW ===${NC}"
+    done
+    ufw --dry-run enable >/dev/null
+    ufw --force enable
     ufw status numbered
+
+    print_warning "Не закрывайте эту сессию. Откройте вторую SSH-сессию и проверьте вход."
+    read -r -p "Вторая SSH-сессия успешно подключилась? [y/N]: " value
+    if [[ "$value" =~ ^[Yy]$ ]]; then
+        ROLLBACK_ACTIVE=0; ROLLBACK_KIND=""
+        log "INFO" "UFW применён и подтверждён второй SSH-сессией. Резервная копия: $BACKUP_DIR/ufw"
+        print_success "UFW применён безопасно."
+    else
+        rollback 0
+        print_error "Новые правила отменены; восстановлена прежняя конфигурация UFW."
+    fi
 }
 
 
@@ -613,9 +545,17 @@ configure_ssh() {
     log "INFO" "Настройка безопасности SSH..."
 
     # Проверка наличия службы SSH
-    if ! systemctl is-active --quiet ssh; then
+    if ! command -v sshd >/dev/null 2>&1; then
         log "INFO" "Служба SSH не найдена. Установка OpenSSH..."
-        apt install -y openssh-server
+        apt-get install -y openssh-server
+    fi
+
+    if [[ -f /root/.ssh/authorized_keys ]]; then
+        AUTHORIZED_KEYS_EXISTED=1
+        cp -a /root/.ssh/authorized_keys "$BACKUP_DIR/authorized_keys"
+    else
+        AUTHORIZED_KEYS_EXISTED=0
+        rm -f "$BACKUP_DIR/authorized_keys"
     fi
 
     # Создание директории .ssh и файла authorized_keys
@@ -641,40 +581,61 @@ configure_ssh() {
         log "INFO" "ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEArV1... user@hostname"
         read -p "Введите ваш публичный ключ SSH: " public_key
 
-        # Проверка валидности публичного ключа
-        if [[ -z "$public_key" || ! "$public_key" =~ ^ssh-(rsa|ed25519|ecdsa) ]]; then
-            log "ERROR" "Некорректный публичный ключ. Убедитесь, что вы ввели его правильно."
-            exit 1
+        local key_file
+        key_file="$(mktemp)"
+        chmod 0600 "$key_file"
+        printf '%s\n' "$public_key" > "$key_file"
+        if ! ssh-keygen -l -f "$key_file" >/dev/null 2>&1; then
+            rm -f "$key_file"
+            log "ERROR" "OpenSSH не распознал публичный ключ."
+            return 1
         fi
-
-        # Добавление публичного ключа в authorized_keys
-        echo "$public_key" >> /root/.ssh/authorized_keys
+        rm -f "$key_file"
+        printf '%s\n' "$public_key" >> /root/.ssh/authorized_keys
         log "INFO" "Публичный ключ успешно добавлен в /root/.ssh/authorized_keys."
     fi
 
-    # Настройка параметров SSH
-    update_ssh_config() {
-        local key="$1"
-        local value="$2"
-        if ! grep -q "^$key" /etc/ssh/sshd_config; then
-            echo "$key $value" >> /etc/ssh/sshd_config
-        else
-            sed -i "s/^$key.*/$key $value/" /etc/ssh/sshd_config
-        fi
+    chown root:root /root/.ssh /root/.ssh/authorized_keys
+    chmod 0700 /root/.ssh
+    chmod 0600 /root/.ssh/authorized_keys
+    ssh-keygen -l -f /root/.ssh/authorized_keys >/dev/null 2>&1 || {
+        print_error "В authorized_keys нет ключа, распознаваемого OpenSSH. Отключение пароля отменено."
+        return 1
     }
 
-    update_ssh_config "PermitRootLogin" "prohibit-password"
-    update_ssh_config "PasswordAuthentication" "no"
-    update_ssh_config "X11Forwarding" "no"
-    update_ssh_config "MaxAuthTries" "3"
-    update_ssh_config "Protocol" "2"
-    update_ssh_config "AllowAgentForwarding" "no"
-    update_ssh_config "AllowTcpForwarding" "no"
-    update_ssh_config "LoginGraceTime" "30"
+    mkdir -p /etc/ssh/sshd_config.d
+    cp -a /etc/ssh/sshd_config "$BACKUP_DIR/sshd_config"
+    if [[ -f /etc/ssh/sshd_config.d/00-server-scripts.conf ]]; then
+        cp -a /etc/ssh/sshd_config.d/00-server-scripts.conf "$BACKUP_DIR/00-server-scripts.conf"
+    else
+        rm -f "$BACKUP_DIR/00-server-scripts.conf"
+    fi
+    ROLLBACK_KIND=ssh; ROLLBACK_ACTIVE=1
 
-    # Перезапуск службы SSH
-    systemctl restart ssh
-    log "INFO" "Служба SSH перезапущена. Парольная аутентификация отключена."
+    render_ssh_dropin > /etc/ssh/sshd_config.d/00-server-scripts.conf
+    chmod 0644 /etc/ssh/sshd_config.d/00-server-scripts.conf
+    sshd -t
+
+    local effective
+    effective="$(sshd -T)"
+    grep -q '^permitrootlogin without-password$\|^permitrootlogin prohibit-password$' <<< "$effective"
+    grep -q '^pubkeyauthentication yes$' <<< "$effective"
+    grep -q '^passwordauthentication no$' <<< "$effective"
+    grep -q '^kbdinteractiveauthentication no$' <<< "$effective"
+    systemctl reload ssh
+    systemctl is-active --quiet ssh
+
+    print_warning "Не закрывайте текущую сессию. Откройте вторую SSH-сессию тем же ключом."
+    local confirmed
+    read -r -p "Вход по ключу во второй сессии успешен? [y/N]: " confirmed
+    if [[ "$confirmed" =~ ^[Yy]$ ]]; then
+        ROLLBACK_ACTIVE=0; ROLLBACK_KIND=""
+        log "INFO" "Конфигурация SSH проверена sshd -t, перезагружена и подтверждена второй сессией."
+        print_success "SSH настроен безопасно. Резервная копия: $BACKUP_DIR"
+    else
+        rollback 0
+        print_error "Новая конфигурация SSH отменена; восстановлена предыдущая."
+    fi
 }
 
 # Системные твики
@@ -939,23 +900,7 @@ show_menu() {
     done
 }
 
-# Запуск главного меню
-show_menu
-
-# Финальная информация
-log "INFO" "=== Установка завершена ==="
-log "INFO" "Backup directory: $BACKUP_DIR"
-log "INFO" "Log file: $LOG_FILE"
-
-# Запрос на перезагрузку
-if tty -s; then
-    read -p "Перезагрузить систему сейчас? (y/n): " choice
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        log "INFO" "Выполняется перезагрузка..."
-        shutdown -r now
-    else
-        log "WARNING" "Перезагрузка отложена. Рекомендуется перезагрузить систему позже."
-    fi
-else
-    log "INFO" "Скрипт запущен в неинтерактивном режиме. Перезагрузка не выполняется."
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    initialize_script
+    show_menu
 fi
