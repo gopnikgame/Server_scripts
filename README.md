@@ -34,6 +34,25 @@ wget -qO server_launcher.sh https://raw.githubusercontent.com/gopnikgame/Server_
 
 ---
 
+## 🧠 Навык Codex для серверных скриптов
+
+В репозитории находится `.codex/skills/linux-server-script-engineer` —
+repo-local навык для аудита, отладки, безопасной доработки и живого тестирования
+Bash-инсталляторов, systemd, APT, сети, SSH и firewall. Он включает тематические
+reference-файлы и read-only аудиторы с выводом `PASS/WARN/FAIL/SKIP`.
+
+Быстрая локальная проверка навыка:
+
+```bash
+bash .codex/skills/linux-server-script-engineer/scripts/self-test.sh
+bash .codex/skills/linux-server-script-engineer/scripts/audit-shell-project.sh .
+```
+
+Предупреждения аудитора являются поводом для ручной проверки, а не
+автоматически подтверждёнными дефектами. Сам навык не изменяет сервер.
+
+---
+
 ### 1 · Ubuntu Pre-Install
 
 Первоначальная настройка сервера «с нуля»:

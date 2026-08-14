@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linux Server Script Engineer"
+  short_description: "Проверяет и укрепляет серверные shell-скрипты"
+  default_prompt: "Use $linux-server-script-engineer to audit and safely improve this Linux server script."
