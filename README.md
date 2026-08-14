@@ -1,7 +1,7 @@
 # 🚀 Server Scripts Manager
 
 ![Launcher](https://img.shields.io/badge/launcher-v1.0.7-blue)
-![Proxy](https://img.shields.io/badge/proxy--manager-v1.2.0-blueviolet)
+![Proxy](https://img.shields.io/badge/proxy--manager-v1.3.0--test-blueviolet)
 ![Updated](https://img.shields.io/badge/updated-2026--08--14-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04-orange)
@@ -97,6 +97,19 @@ SSH настраивается отдельным drop-in-файлом, публ
 | 7 | Отключить прокси | Удалить все настройки, остановить сервисы |
 
 **VLESS поддерживает:** REALITY+TCP, TLS+TCP/WS/gRPC, автоустановку `xray-core`.
+
+В тестовой версии `1.3.0-test` установка Xray загружает официальный release-архив
+и соответствующий `.dgst`, проверяет SHA-256 и только затем устанавливает бинарный
+файл. Новый конфиг сначала проходит `xray run -test`, предыдущий конфиг сохраняется
+для rollback. VLESS UUID и реквизиты HTTP-прокси полностью показываются в
+интерактивном терминале для копирования, но не записываются в общий лог; файлы с
+реквизитами создаются с правами `0600`, Xray-конфиг — `0640`.
+
+> **Требуется тестирование на живой системе.** Локально проверены синтаксис,
+> парсинг входных данных, безопасная запись состояния и статические инварианты.
+> Установку/обновление Xray, systemd sandbox, перезапуск, rollback и реальный
+> VLESS TCP/REALITY-трафик нужно проверить на тестовом Debian/Ubuntu VPS с
+> доступом к консоли провайдера.
 
 ---
 

@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Version: 1.2.0
+# Version: 1.3.0-test
 # Author: gopnikgame
 # Created: 2025-07-22 14:00:00
-# Last Modified: 2025-07-22 16:00:00
+# Last Modified: 2026-08-14
 # Description: Server proxy configuration module
 #              Modes: direct HTTP proxy, SSH tunnel + Privoxy, VPN system proxy, Xray VLESS
 #              Includes: connectivity diagnostics and mode recommendation wizard
@@ -28,6 +28,8 @@ SSH_TUNNEL_SERVICE="/etc/systemd/system/ssh-tunnel-proxy.service"
 PROXY_STATE_FILE="/etc/server-scripts/proxy.conf"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 LOG_FILE="/var/log/server-scripts/setup_proxy.log"
+XRAY_API_URL="${XRAY_API_URL:-https://api.github.com/repos/XTLS/Xray-core/releases/latest}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # ─── Утилиты вывода ────────────────────────────────────────────────────────────
 
@@ -41,6 +43,42 @@ log_error() {
 
 log_success() {
     echo -e "${GREEN}[УСПЕХ] - $1${NC}" | tee -a "$LOG_FILE"
+}
+
+# Секреты показываем в интерактивном терминале, но не записываем в общий лог.
+print_secret() {
+    printf '%b\n' "$1" > /dev/tty 2>/dev/null || printf '%b\n' "$1"
+}
+
+validate_proxy_url() {
+    local proxy_url="$1"
+    PROXY_URL_TO_VALIDATE="$proxy_url" "$PYTHON_BIN" <<'PYEOF'
+import os, sys, urllib.parse
+value = os.environ["PROXY_URL_TO_VALIDATE"]
+if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+    sys.exit(1)
+parsed = urllib.parse.urlsplit(value)
+try:
+    port = parsed.port
+except ValueError:
+    sys.exit(1)
+if parsed.scheme not in {"http", "https"} or not parsed.hostname or port is None:
+    sys.exit(1)
+if not 1 <= port <= 65535 or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+    sys.exit(1)
+PYEOF
+}
+
+shell_quote() {
+    printf '%q' "$1"
+}
+
+cleanup_xray_temp() {
+    local directory="${1:-}"
+    case "$directory" in
+        /tmp/setup-proxy-xray.*) rm -rf -- "$directory" ;;
+        *) log_error "Отказ от очистки неожиданного временного пути: $directory"; return 1 ;;
+    esac
 }
 
 print_header() {
@@ -67,33 +105,48 @@ check_root() {
 apply_proxy() {
     local proxy_url="$1"
     local no_proxy="localhost,127.0.0.1,::1"
+    local profile_proxy profile_no_proxy env_proxy env_no_proxy apt_proxy
+
+    validate_proxy_url "$proxy_url" || {
+        log_error "Некорректный URL прокси"
+        return 1
+    }
+    profile_proxy=$(shell_quote "$proxy_url")
+    profile_no_proxy=$(shell_quote "$no_proxy")
+    env_proxy=${proxy_url//\\/\\\\}; env_proxy=${env_proxy//\"/\\\"}
+    env_no_proxy=${no_proxy//\\/\\\\}; env_no_proxy=${env_no_proxy//\"/\\\"}
+    apt_proxy=${proxy_url//\\/\\\\}; apt_proxy=${apt_proxy//\"/\\\"}
+    umask 077
 
     # /etc/environment — сохраняется между перезагрузками
     sed -i '/^http_proxy\|^https_proxy\|^HTTP_PROXY\|^HTTPS_PROXY\|^no_proxy\|^NO_PROXY/d' \
         "$PROXY_ENV_FILE" 2>/dev/null || true
     printf '\nhttp_proxy="%s"\nhttps_proxy="%s"\nHTTP_PROXY="%s"\nHTTPS_PROXY="%s"\nno_proxy="%s"\nNO_PROXY="%s"\n' \
-        "$proxy_url" "$proxy_url" "$proxy_url" "$proxy_url" "$no_proxy" "$no_proxy" \
+        "$env_proxy" "$env_proxy" "$env_proxy" "$env_proxy" "$env_no_proxy" "$env_no_proxy" \
         >> "$PROXY_ENV_FILE"
+    chmod 0600 "$PROXY_ENV_FILE"
 
     # /etc/profile.d/proxy.sh — экспорт в shell сессии
     cat > "$PROXY_PROFILE" <<EOF
-export http_proxy="$proxy_url"
-export https_proxy="$proxy_url"
-export HTTP_PROXY="$proxy_url"
-export HTTPS_PROXY="$proxy_url"
-export no_proxy="$no_proxy"
-export NO_PROXY="$no_proxy"
+export http_proxy=$profile_proxy
+export https_proxy=$profile_proxy
+export HTTP_PROXY=$profile_proxy
+export HTTPS_PROXY=$profile_proxy
+export no_proxy=$profile_no_proxy
+export NO_PROXY=$profile_no_proxy
 EOF
-    chmod +x "$PROXY_PROFILE"
+    chmod 0600 "$PROXY_PROFILE"
 
     # APT — для apt-get / apt
     mkdir -p /etc/apt/apt.conf.d
     cat > "$PROXY_APT_CONF" <<EOF
-Acquire::http::Proxy "$proxy_url";
-Acquire::https::Proxy "$proxy_url";
+Acquire::http::Proxy "$apt_proxy";
+Acquire::https::Proxy "$apt_proxy";
 EOF
+    chmod 0600 "$PROXY_APT_CONF"
 
-    log_success "Системный прокси применён: $proxy_url"
+    log_success "Системный прокси применён (адрес показан только в терминале)"
+    print_secret "${GREEN}Системный прокси: ${CYAN}${proxy_url}${NC}"
 }
 
 # Удаление всех системных настроек прокси
@@ -108,7 +161,7 @@ remove_proxy() {
 # Проверка доступности прокси
 test_proxy() {
     local proxy_url="$1"
-    log "Тестирование прокси: $proxy_url"
+    log "Тестирование прокси (реквизиты скрыты в логе)"
     # Пробуем xanmod (основная задача), затем google как запасной
     if curl -sfI --connect-timeout 10 --max-time 15 \
             --proxy "$proxy_url" "http://deb.xanmod.org" &>/dev/null; then
@@ -127,18 +180,25 @@ test_proxy() {
 # Сохранение состояния для отображения статуса
 save_proxy_state() {
     mkdir -p "$(dirname "$PROXY_STATE_FILE")"
+    umask 077
+    local mode_q url_q details_q configured_q
+    printf -v mode_q '%q' "$1"
+    printf -v url_q '%q' "$2"
+    printf -v details_q '%q' "${3:-}"
+    printf -v configured_q '%q' "$(date '+%Y-%m-%d %H:%M:%S')"
     cat > "$PROXY_STATE_FILE" <<EOF
-PROXY_MODE="$1"
-PROXY_URL="$2"
-PROXY_DETAILS="${3:-}"
-PROXY_CONFIGURED="$(date '+%Y-%m-%d %H:%M:%S')"
+PROXY_MODE=$mode_q
+PROXY_URL=$url_q
+PROXY_DETAILS=$details_q
+PROXY_CONFIGURED=$configured_q
 EOF
+    chmod 0600 "$PROXY_STATE_FILE"
 }
 
 # ─── URL утилиты и парсинг VLESS ──────────────────────────────────────────────
 
 url_decode() {
-    python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()), end='')" 2>/dev/null || cat
+    "$PYTHON_BIN" -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()), end='')" 2>/dev/null || cat
 }
 
 get_qparam() {
@@ -197,6 +257,20 @@ parse_vless_link() {
     VLESS_REMARK="${VLESS_REMARK:-xray-proxy}"
 }
 
+validate_vless_params() {
+    [[ "$VLESS_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+    [[ -n "$VLESS_HOST" && "$VLESS_HOST" != *[[:space:]]* ]] || return 1
+    [[ "$VLESS_PORT" =~ ^[0-9]+$ ]] && (( VLESS_PORT >= 1 && VLESS_PORT <= 65535 )) || return 1
+    [[ "$VLESS_SECURITY" =~ ^(none|tls|reality)$ ]] || return 1
+    [[ "$VLESS_NETWORK" =~ ^(tcp|raw|ws|grpc)$ ]] || return 1
+    if [[ "$VLESS_SECURITY" == "reality" ]]; then
+        [[ -n "$VLESS_SNI" && -n "$VLESS_PBK" ]] || return 1
+    fi
+    if [[ "$VLESS_SECURITY" == "tls" ]]; then
+        [[ -n "$VLESS_SNI" ]] || return 1
+    fi
+}
+
 # ─── Установка Xray-core ───────────────────────────────────────────────────────
 
 install_xray() {
@@ -207,74 +281,125 @@ install_xray() {
         return 0
     fi
 
-    log "Установка Xray-core..."
-    apt-get install -y curl unzip -qq 2>/dev/null || true
-
-    # Официальный инсталлятор
-    if curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-            -o /tmp/xray-install.sh 2>/dev/null && bash /tmp/xray-install.sh install 2>>"$LOG_FILE"; then
-        rm -f /tmp/xray-install.sh
-        log_success "Xray установлен через официальный инсталлятор"
-        return 0
+    log "Установка Xray-core из проверенного release-архива..."
+    if ! apt-get install -y curl unzip python3 ca-certificates -qq; then
+        log_error "Не удалось установить зависимости Xray"
+        return 1
     fi
-    rm -f /tmp/xray-install.sh
 
-    # Резервный вариант: прямая загрузка через GitHub API
-    log "Попытка прямой загрузки с GitHub Releases..."
-    local api_url="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-    local download_url
-    download_url=$(curl -sfL "$api_url" 2>/dev/null | python3 -c \
-        "import sys,json; d=json.load(sys.stdin); print(next((a['browser_download_url'] for a in d['assets'] if 'linux-64.zip' in a['name'] and 'dgst' not in a['name']), ''))" \
-        2>/dev/null || true)
+    local machine asset_name tmp metadata download_url digest_url expected actual xray_group unit_candidate
+    case "$(uname -m)" in
+        x86_64|amd64) machine="64" ;;
+        aarch64|arm64) machine="arm64-v8a" ;;
+        *) log_error "Архитектура $(uname -m) пока не поддерживается автоматической установкой Xray"; return 1 ;;
+    esac
+    asset_name="Xray-linux-${machine}.zip"
+    tmp=$(mktemp -d /tmp/setup-proxy-xray.XXXXXX)
+    chmod 0700 "$tmp"
+    metadata="$tmp/release.json"
 
-    if [[ -n "$download_url" ]]; then
-        local tmp
-        tmp=$(mktemp -d)
-        if curl -fSL --progress-bar "$download_url" -o "$tmp/xray.zip" 2>>"$LOG_FILE"; then
-            unzip -q "$tmp/xray.zip" -d "$tmp"
-            install -m 755 "$tmp/xray" /usr/local/bin/xray
-            mkdir -p "$XRAY_CONFIG_DIR" /var/log/xray
-            rm -rf "$tmp"
+    if ! curl --fail --silent --show-error --location --connect-timeout 15 --max-time 60 \
+            -H 'Accept: application/vnd.github+json' "$XRAY_API_URL" -o "$metadata" 2>>"$LOG_FILE"; then
+        log_error "Не удалось получить метаданные Xray Release"
+        cleanup_xray_temp "$tmp"
+        return 1
+    fi
+    readarray -t release_urls < <(XRAY_METADATA="$metadata" XRAY_ASSET="$asset_name" "$PYTHON_BIN" <<'PYEOF'
+import json, os
+with open(os.environ["XRAY_METADATA"], encoding="utf-8") as stream:
+    release = json.load(stream)
+assets = {item["name"]: item["browser_download_url"] for item in release.get("assets", [])}
+name = os.environ["XRAY_ASSET"]
+print(assets.get(name, ""))
+print(assets.get(name + ".dgst", ""))
+PYEOF
+    )
+    download_url="${release_urls[0]:-}"
+    digest_url="${release_urls[1]:-}"
+    if [[ -z "$download_url" || -z "$digest_url" ]]; then
+        log_error "В Xray Release нет ${asset_name} или файла контрольных сумм"
+        cleanup_xray_temp "$tmp"
+        return 1
+    fi
+    if ! curl --fail --silent --show-error --location --connect-timeout 15 --max-time 300 \
+            "$download_url" -o "$tmp/xray.zip" 2>>"$LOG_FILE" ||
+       ! curl --fail --silent --show-error --location --connect-timeout 15 --max-time 60 \
+            "$digest_url" -o "$tmp/xray.zip.dgst" 2>>"$LOG_FILE"; then
+        log_error "Не удалось загрузить Xray или контрольную сумму"
+        cleanup_xray_temp "$tmp"
+        return 1
+    fi
+    expected=$(awk -F '= ' '/SHA2-256|SHA256|256=/ {print $NF; exit}' "$tmp/xray.zip.dgst" | tr -d '[:space:]')
+    actual=$(sha256sum "$tmp/xray.zip" | awk '{print $1}')
+    if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ || "${expected,,}" != "$actual" ]]; then
+        log_error "SHA-256 Xray не совпал; установка отменена"
+        cleanup_xray_temp "$tmp"
+        return 1
+    fi
+    if ! unzip -Z1 "$tmp/xray.zip" | grep -qx 'xray' ||
+       unzip -Z1 "$tmp/xray.zip" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+        log_error "Архив Xray имеет неожиданный или небезопасный состав"
+        cleanup_xray_temp "$tmp"
+        return 1
+    fi
+    unzip -p "$tmp/xray.zip" xray > "$tmp/xray"
+    chmod 0755 "$tmp/xray"
+    "$tmp/xray" version >>"$LOG_FILE" 2>&1 || {
+        log_error "Загруженный бинарный файл Xray не запускается"
+        cleanup_xray_temp "$tmp"
+        return 1
+    }
 
-            cat > /etc/systemd/system/xray.service <<'XSVC'
+    install -m 0755 "$tmp/xray" /usr/local/bin/xray
+    mkdir -p "$XRAY_CONFIG_DIR" /var/log/xray
+    xray_group=$(id -gn nobody)
+    install -o nobody -g "$xray_group" -m 0600 /dev/null /var/log/xray/access.log
+    install -o nobody -g "$xray_group" -m 0600 /dev/null /var/log/xray/error.log
+
+    unit_candidate="$tmp/xray.service"
+    cat > "$unit_candidate" <<XSVC
 [Unit]
 Description=Xray Service
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
+Documentation=https://github.com/XTLS/Xray-core
+After=network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+User=nobody
+Group=$xray_group
 NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+ExecStart=/usr/local/bin/xray run -c /usr/local/etc/xray/config.json
 Restart=on-failure
 RestartPreventExitStatus=23
-LimitNPROC=10000
 LimitNOFILE=1000000
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/xray
+RuntimeDirectory=xray
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
 XSVC
-            systemctl daemon-reload
-            log_success "Xray установлен из GitHub Releases"
-            return 0
-        fi
-        rm -rf "$tmp"
+    if ! systemd-analyze verify "$unit_candidate" >>"$LOG_FILE" 2>&1; then
+        cleanup_xray_temp "$tmp"
+        log_error "systemd отклонил unit Xray; установка сервиса отменена"
+        return 1
     fi
-
-    log_error "Не удалось установить Xray автоматически"
-    echo
-    echo -e "${YELLOW}Установите Xray вручную:${NC}"
-    echo -e "  ${CYAN}https://github.com/XTLS/Xray-core/releases${NC}"
-    echo -e "Распакуйте binary в ${CYAN}/usr/local/bin/xray${NC}, затем повторите."
-    return 1
+    install -o root -g root -m 0644 "$unit_candidate" /etc/systemd/system/xray.service
+    cleanup_xray_temp "$tmp"
+    systemctl daemon-reload
+    log_success "Xray установлен; SHA-256 release-архива проверен"
 }
 
 # Генерация config.json из переменных VLESS_* через Python (корректный JSON, без heredoc-инъекций)
 generate_xray_config() {
     mkdir -p "$XRAY_CONFIG_DIR" /var/log/xray
     log "Генерация конфигурации Xray..."
+    local candidate backup=""
+    candidate=$(mktemp "${XRAY_CONFIG_DIR}/.config.json.XXXXXX")
+    chmod 0600 "$candidate"
 
     local gen_result=0
     VLESS_UUID="$VLESS_UUID" \
@@ -290,8 +415,8 @@ generate_xray_config() {
     VLESS_SPX="$VLESS_SPX" \
     VLESS_HOST_HEADER="$VLESS_HOST_HEADER" \
     VLESS_PATH="$VLESS_PATH" \
-    XRAY_CFG="${XRAY_CONFIG_DIR}/config.json" \
-    python3 <<'PYEOF' || gen_result=$?
+    XRAY_CFG="$candidate" \
+    "$PYTHON_BIN" <<'PYEOF' || gen_result=$?
 import json, os
 
 uuid     = os.environ["VLESS_UUID"]
@@ -361,9 +486,22 @@ with open(cfg_file, "w") as f:
 PYEOF
 
     if [ $gen_result -ne 0 ]; then
+        rm -f -- "$candidate"
         log_error "Ошибка генерации конфигурации"
         return 1
     fi
+    if ! xray run -test -c "$candidate" >>"$LOG_FILE" 2>&1; then
+        rm -f -- "$candidate"
+        log_error "Xray отклонил новую конфигурацию; текущая конфигурация не изменена"
+        return 1
+    fi
+    if [[ -f "${XRAY_CONFIG_DIR}/config.json" ]]; then
+        backup="${XRAY_CONFIG_DIR}/config.json.backup.$(date '+%Y%m%d-%H%M%S')"
+        cp -a -- "${XRAY_CONFIG_DIR}/config.json" "$backup"
+    fi
+    install -o root -g "$(id -gn nobody)" -m 0640 "$candidate" "${XRAY_CONFIG_DIR}/config.json"
+    rm -f -- "$candidate"
+    XRAY_CONFIG_BACKUP="$backup"
     log_success "Конфигурация записана: ${XRAY_CONFIG_DIR}/config.json"
 }
 
@@ -391,8 +529,8 @@ configure_xray_vless() {
 
     parse_vless_link "$vless_link"
 
-    if [[ -z "$VLESS_UUID" || -z "$VLESS_HOST" || -z "$VLESS_PORT" ]]; then
-        log_error "Не удалось распознать UUID, хост или порт из ссылки"
+    if ! validate_vless_params; then
+        log_error "VLESS ссылка содержит неподдерживаемые или некорректные параметры"
         return 1
     fi
 
@@ -426,8 +564,15 @@ configure_xray_vless() {
         return 1
     fi
 
-    systemctl enable xray 2>>"$LOG_FILE"
-    systemctl restart xray
+    if ! systemctl enable xray 2>>"$LOG_FILE" || ! systemctl restart xray 2>>"$LOG_FILE"; then
+        log_error "Xray не удалось активировать"
+        if [[ -n "${XRAY_CONFIG_BACKUP:-}" && -f "$XRAY_CONFIG_BACKUP" ]]; then
+            cp -a -- "$XRAY_CONFIG_BACKUP" "${XRAY_CONFIG_DIR}/config.json"
+            systemctl restart xray 2>>"$LOG_FILE" || true
+            log "Восстановлена предыдущая конфигурация: $XRAY_CONFIG_BACKUP"
+        fi
+        return 1
+    fi
     sleep 3
 
     local proxy_url="http://127.0.0.1:10809"
@@ -710,7 +855,7 @@ configure_http_proxy() {
         log_error "Адрес прокси не может быть пустым"
         return 1
     fi
-    if ! [[ "$proxy_url" =~ ^https?:// ]]; then
+    if ! validate_proxy_url "$proxy_url"; then
         log_error "Неверный формат. Пример: http://1.2.3.4:3128"
         return 1
     fi
@@ -927,7 +1072,7 @@ configure_vpn_proxy() {
         log_error "Адрес прокси не может быть пустым"
         return 1
     fi
-    if ! [[ "$proxy_url" =~ ^https?:// ]]; then
+    if ! validate_proxy_url "$proxy_url"; then
         log_error "Неверный формат. Пример: http://127.0.0.1:7890"
         return 1
     fi
@@ -999,7 +1144,7 @@ disable_proxy() {
 
 show_menu() {
     while true; do
-        print_header "НАСТРОЙКА ПРОКСИ v1.2.0"
+        print_header "НАСТРОЙКА ПРОКСИ v1.3.0-test"
         show_status
 
         echo -e "${YELLOW}Выберите режим:${NC}"
@@ -1036,6 +1181,10 @@ show_menu() {
 
 # ─── Точка входа ───────────────────────────────────────────────────────────────
 
-mkdir -p "$(dirname "$LOG_FILE")"
-check_root
-show_menu
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    chmod 0600 "$LOG_FILE"
+    check_root
+    show_menu
+fi
