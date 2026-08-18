@@ -420,13 +420,30 @@ configure_firewall() {
     command -v ufw >/dev/null || { print_error "UFW не установлен."; return 1; }
     command -v sshd >/dev/null || { print_error "sshd не найден: сначала установите OpenSSH Server."; return 1; }
 
-    local ssh_port client_ip open_http restrict_ssh custom_ports restrict_custom_ports value port ip
+    local ssh_port client_ip open_http restrict_ssh custom_ports restrict_custom_ports value port ip firewall_mode
     local -a ssh_allowed_ips=() custom_port_list=() custom_ip_list=()
     ssh_port="$(detect_ssh_port)"
     client_ip="$(current_ssh_client_ip)"
     print_header "Безопасный план UFW"
     echo -e "${CYAN}Фактический порт sshd:${NC} $ssh_port"
     [[ -z "$client_ip" ]] || echo -e "${CYAN}Адрес текущей SSH-сессии:${NC} $client_ip"
+    echo
+    echo -e "${CYAN}Текущие правила UFW:${NC}"
+    ufw status verbose || true
+    echo
+    ufw status numbered || true
+    echo
+    echo "1) Сохранить существующие правила и добавить новые"
+    echo "2) Удалить существующие правила и создать набор с нуля"
+    echo "0) Отмена"
+    read -r -p "Режим настройки UFW [0-2]: " firewall_mode
+    case "$firewall_mode" in
+        1) print_step "Существующие правила будут сохранены." ;;
+        2) print_warning "Все существующие правила UFW будут удалены после резервного копирования." ;;
+        0|'') print_step "Настройка UFW отменена."; return 0 ;;
+        *) print_error "Неверный режим UFW."; return 1 ;;
+    esac
+
     read -r -p "Открыть HTTP 80/tcp? [y/N]: " open_http
     read -r -p "Ограничить SSH списком IP/CIDR? [y/N]: " restrict_ssh
     if [[ "$restrict_ssh" =~ ^[Yy]$ ]]; then
@@ -459,7 +476,12 @@ configure_firewall() {
         fi
     fi
 
-    echo; print_warning "Существующие правила будут заменены. Сначала создаётся полная копия /etc/ufw."
+    echo
+    if [[ "$firewall_mode" == 2 ]]; then
+        print_warning "Существующие правила будут заменены. Сначала создаётся полная копия /etc/ufw."
+    else
+        print_step "Новые разрешения будут добавлены к существующим правилам."
+    fi
     read -r -p "Применить показанный план? [y/N]: " value
     [[ "$value" =~ ^[Yy]$ ]] || { print_step "Настройка отменена."; return 0; }
 
@@ -467,10 +489,12 @@ configure_firewall() {
     cp -a /etc/ufw "$BACKUP_DIR/ufw"
     LC_ALL=C ufw status | grep -q '^Status: active' && UFW_WAS_ACTIVE=1 || UFW_WAS_ACTIVE=0
     ROLLBACK_KIND=ufw; ROLLBACK_ACTIVE=1
-    ufw --force disable >/dev/null 2>&1 || true
-    ufw --force reset >/dev/null
-    ufw default deny incoming
-    ufw default allow outgoing
+    if [[ "$firewall_mode" == 2 ]]; then
+        ufw --force disable >/dev/null 2>&1 || true
+        ufw --force reset >/dev/null
+        ufw default deny incoming
+        ufw default allow outgoing
+    fi
     ufw allow 443/tcp
     if [[ "$open_http" =~ ^[Yy]$ ]]; then ufw allow 80/tcp; fi
     if [[ "$restrict_ssh" =~ ^[Yy]$ ]]; then
@@ -485,8 +509,10 @@ configure_firewall() {
             ufw allow "$port/tcp"
         fi
     done
-    ufw --dry-run enable >/dev/null
-    ufw --force enable
+    if (( UFW_WAS_ACTIVE == 0 )); then
+        ufw --dry-run enable >/dev/null
+        ufw --force enable
+    fi
     ufw status numbered
 
     print_warning "Не закрывайте эту сессию. Откройте вторую SSH-сессию и проверьте вход."
@@ -881,8 +907,6 @@ show_menu() {
         ((i++))
         echo -e "$i) ${GREEN}Применить системные твики${NC}"
         ((i++))
-        echo -e "$i) ${YELLOW}Выполнить все задачи автоматически${NC}"
-        ((i++))
         echo -e "$i) ${YELLOW}Управление IPv6${NC}"
         ((i++))
         echo -e "$i) ${YELLOW}Перезагрузить систему${NC}"
@@ -917,17 +941,9 @@ show_menu() {
                 apply_system_tweaks
                 ;;
             7)
-                install_dependencies_and_update_system
-                install_dnscrypt
-                configure_firewall
-                change_root_password
-                configure_ssh
-                apply_system_tweaks
-                ;;
-            8)
                 manage_ipv6
                 ;;
-            9)
+            8)
                 reboot_system
                 ;;
             *)

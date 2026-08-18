@@ -49,6 +49,19 @@ if [[ -z "$backup_line" || -z "$reset_line" || "$backup_line" -ge "$reset_line" 
     failures=$((failures + 1))
 fi
 
+grep -q 'Сохранить существующие правила и добавить новые' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: additive UFW mode is missing\n' >&2
+    failures=$((failures + 1))
+}
+grep -q '\[\[ "$firewall_mode" == 2 \]\]' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: UFW reset is not gated by explicit replace mode\n' >&2
+    failures=$((failures + 1))
+}
+if grep -q 'Выполнить все задачи автоматически' "$ROOT_DIR/ubuntu_pre_install.sh"; then
+    printf 'FAIL: obsolete automatic profile is still present\n' >&2
+    failures=$((failures + 1))
+fi
+
 if (( failures > 0 )); then
     printf '%d pre-install test(s) failed\n' "$failures" >&2
     exit 1
