@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 # Version: 1.0.0
 # Author: gopnikgame
@@ -6,7 +6,7 @@
 # Last Modified: 2025-02-20 20:00:00
 # Description: Swap file management module
 
-set -e
+set -Eeuo pipefail
 
 # Цветовые коды
 RED='\033[0;31m'
@@ -17,9 +17,9 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # Константы
-SWAPFILE="/swapfile"
-DEFAULT_SWAPSIZE_MB=2048
-LOG_FILE="/var/log/system_setup.log"
+SWAPFILE="${SWAPFILE:-/swapfile}"
+LOG_FILE="${LOG_FILE:-/var/log/system_setup.log}"
+FSTAB_FILE="${FSTAB_FILE:-/etc/fstab}"
 
 # Функции для красивого вывода
 print_header() {
@@ -49,7 +49,8 @@ print_error() {
 log() {
     local level="$1"
     shift
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     case "$level" in
         "INFO") local color=$GREEN ;;
     "WARNING") local color=$YELLOW ;;
@@ -58,6 +59,18 @@ log() {
     esac
     echo -e "${timestamp} [${color}${level}${NC}] $*"
     echo "${timestamp} [${level}] $*" >> "$LOG_FILE"
+}
+
+is_swap_active() {
+    swapon --noheadings --raw --output=NAME 2>/dev/null | grep -Fxq -- "$SWAPFILE"
+}
+
+fstab_has_swap() {
+    awk -v path="$SWAPFILE" '$1 == path && $3 == "swap" {found=1} END {exit !found}' "$FSTAB_FILE"
+}
+
+ensure_fstab_entry() {
+    fstab_has_swap || printf '%s none swap sw 0 0\n' "$SWAPFILE" >> "$FSTAB_FILE"
 }
 
 # Проверка root прав
@@ -76,17 +89,17 @@ manage_swap() {
         print_header "Управление файлом подкачки (Swap)"
         
         # Проверяем текущее состояние swap
-        local current_swap_size=0
-    local swap_enabled=false
+        local current_swap_size=0 file_size_bytes
+        local swap_enabled=false
         local swap_file_exists=false
         
         if [ -f "$SWAPFILE" ]; then
       swap_file_exists=true
-   local file_size_bytes=$(stat -c%s "$SWAPFILE" 2>/dev/null || echo "0")
+      file_size_bytes=$(stat -c%s "$SWAPFILE" 2>/dev/null || echo "0")
       current_swap_size=$((file_size_bytes / 1024 / 1024))
   fi
         
-    if swapon --show 2>/dev/null | grep -q "$SWAPFILE"; then
+    if is_swap_active; then
    swap_enabled=true
         fi
         
@@ -231,7 +244,8 @@ create_new_swap() {
         # Проверка корректности ввода
         if [[ "$swap_size" =~ ^[0-9]+$ ]] && [ "$swap_size" -gt 0 ]; then
             # Проверка свободного места на диске
-  local available_space_mb=$(df -m / | awk 'NR==2 {print $4}')
+            local available_space_mb
+            available_space_mb=$(df -m / | awk 'NR==2 {print $4}')
           
      if [ "$swap_size" -gt "$available_space_mb" ]; then
        print_error "Недостаточно свободного места. Доступно: ${available_space_mb} MB"
@@ -291,9 +305,9 @@ fi
     fi
     
     # Добавление в fstab для автоматического монтирования
-    if ! grep -q "$SWAPFILE" /etc/fstab; then
+    if ! fstab_has_swap; then
         print_step "Добавление записи в /etc/fstab..."
- echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+        ensure_fstab_entry
         log "INFO" "Добавлена запись в /etc/fstab"
     fi
     
@@ -325,18 +339,19 @@ enable_existing_swap() {
     
         read -p "Пересоздать файл подкачки? [y/N]: " recreate
       if [[ "$recreate" =~ ^[Yy]$ ]]; then
-   rm -f "$SWAPFILE"
-            local file_size_mb=$(stat -c%s "$SWAPFILE" 2>/dev/null || echo "2147483648")
+            local file_size_mb
+            file_size_mb=$(stat -c%s "$SWAPFILE" 2>/dev/null || echo "2147483648")
             file_size_mb=$((file_size_mb / 1024 / 1024))
+            rm -f -- "$SWAPFILE"
           create_new_swap "$file_size_mb"
         fi
         return 1
     fi
     
     # Добавление в fstab если отсутствует
-    if ! grep -q "$SWAPFILE" /etc/fstab; then
+    if ! fstab_has_swap; then
         print_step "Добавление записи в /etc/fstab..."
-        echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+        ensure_fstab_entry
  log "INFO" "Добавлена запись в /etc/fstab"
     fi
     
@@ -381,8 +396,9 @@ echo
         fi
         
             # Проверка свободного места
-local available_space_mb=$(df -m / | awk 'NR==2 {print $4}')
-  local required_space=$((new_size - current_size))
+            local available_space_mb required_space
+            available_space_mb=$(df -m / | awk 'NR==2 {print $4}')
+            required_space=$((new_size - current_size))
       
      if [ "$required_space" -gt 0 ] && [ "$required_space" -gt "$available_space_mb" ]; then
     print_error "Недостаточно свободного места. Доступно: ${available_space_mb} MB"
@@ -399,19 +415,28 @@ local available_space_mb=$(df -m / | awk 'NR==2 {print $4}')
     log "INFO" "Изменение размера swap с ${current_size} MB на ${new_size} MB..."
     
     # Отключаем swap если он активен
-    if swapon --show 2>/dev/null | grep -q "$SWAPFILE"; then
+    local was_active=false backup_file="${SWAPFILE}.server-scripts-backup"
+    if is_swap_active; then
+        was_active=true
         print_step "Отключение текущего swap..."
-        swapoff "$SWAPFILE" 2>&1 | tee -a "$LOG_FILE"
+        if ! swapoff "$SWAPFILE" 2>&1 | tee -a "$LOG_FILE"; then
+            print_error "Не удалось отключить старый swap; файл оставлен без изменений"
+            return 1
+        fi
     fi
-    
-    # Удаляем старый файл
-    print_step "Удаление старого файла..."
-    rm -f "$SWAPFILE"
-    
-    # Создаем новый swap с новым размером
-    create_new_swap "$new_size"
-    
-    return $?
+
+    rm -f -- "$backup_file"
+    mv -- "$SWAPFILE" "$backup_file"
+    if create_new_swap "$new_size"; then
+        rm -f -- "$backup_file"
+        return 0
+    fi
+
+    print_error "Новый swap не активирован; восстанавливаем прежний файл"
+    rm -f -- "$SWAPFILE"
+    mv -- "$backup_file" "$SWAPFILE"
+    if [[ "$was_active" == true ]]; then swapon "$SWAPFILE" || true; fi
+    return 1
 }
 
 # Функция отключения swap
@@ -421,7 +446,7 @@ disable_swap() {
     log "INFO" "Отключение файла подкачки..."
     
     # Отключаем swap если он активен
-  if swapon --show 2>/dev/null | grep -q "$SWAPFILE"; then
+  if is_swap_active; then
         print_step "Отключение swap..."
       if ! swapoff "$SWAPFILE" 2>&1 | tee -a "$LOG_FILE"; then
           log "ERROR" "Ошибка при отключении swap"
@@ -433,9 +458,9 @@ disable_swap() {
     fi
 
     # Удаляем из fstab
-    if grep -q "$SWAPFILE" /etc/fstab; then
+    if fstab_has_swap; then
         print_step "Удаление записи из /etc/fstab..."
-        sed -i "\|$SWAPFILE|d" /etc/fstab
+        sed -i "\|^${SWAPFILE//|/\\|}[[:space:]]|d" "$FSTAB_FILE"
      log "INFO" "Запись удалена из /etc/fstab"
         print_success "Запись удалена из /etc/fstab"
     fi
@@ -459,7 +484,7 @@ else
     # Показываем текущее состояние
     echo
     print_step "Текущее состояние swap:"
-    if swapon --show 2>/dev/null | grep -q .; then
+    if swapon --noheadings --raw --output=NAME 2>/dev/null | grep -q .; then
   swapon --show
     else
 echo "Swap не активен"
@@ -475,4 +500,6 @@ main() {
 }
 
 # Запуск главной функции
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

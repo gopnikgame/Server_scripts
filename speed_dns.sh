@@ -73,7 +73,8 @@ check_dns_leak() {
     echo " $(_yellow "● IP и Провайдер:")"
     
     # Запрашиваем данные с ipleak.net
-    local ip_data=$(curl -s "https://ipleak.net/json/" 2>/dev/null)
+    local ip_data
+    ip_data=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 15 "https://ipleak.net/json/" 2>/dev/null || true)
     
     if [ -n "$ip_data" ]; then
         if _exists "jq"; then
@@ -93,7 +94,8 @@ check_dns_leak() {
     echo " $(_yellow "● DNS-серверы:")"
     
     if _exists "dig"; then
-        local dns_ip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null)
+        local dns_ip
+        dns_ip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null)
         if [ -n "$dns_ip" ]; then
             echo "   DNS определяет ваш IP как: $dns_ip"
         else
@@ -160,30 +162,31 @@ run_dns_test() {
         local server=${dns_servers[$provider]}
         local total_time=0
         local count=0
+        local start_time result end_time query_time
         
         for domain in "${test_domains[@]}"; do
             if [ "$dns_tool" = "dig" ]; then
                 # Используем dig с увеличенным таймаутом
-                local start_time=$(date +%s%N)
-                local result=$(dig @$server $domain +short +time=2 +retry=1 2>/dev/null)
-                local end_time=$(date +%s%N)
+                start_time=$(date +%s%N)
+                result=$(dig "@$server" "$domain" +short +time=2 +retry=1 2>/dev/null)
+                end_time=$(date +%s%N)
                 
                 if [ -n "$result" ]; then
                     # Расчет времени в миллисекундах (ms)
-                    local query_time=$(( (end_time - start_time) / 1000000 ))
+                    query_time=$(( (end_time - start_time) / 1000000 ))
                     total_time=$((total_time + query_time))
                     count=$((count + 1))
                 fi
             else
                 # Используем nslookup с таймером
-                local start_time=$(date +%s%N)
-                local result=$(nslookup -timeout=2 $domain $server 2>/dev/null)
-                local end_time=$(date +%s%N)
+                start_time=$(date +%s%N)
+                result=$(nslookup -timeout=2 "$domain" "$server" 2>/dev/null)
+                end_time=$(date +%s%N)
                 
                 # Проверяем, что запрос был успешным
                 if echo "$result" | grep -q "Address:" && ! echo "$result" | grep -q "server can't find"; then
                     # Расчет времени в миллисекундах (ms)
-                    local query_time=$(( (end_time - start_time) / 1000000 ))
+                    query_time=$(( (end_time - start_time) / 1000000 ))
                     total_time=$((total_time + query_time))
                     count=$((count + 1))
                 fi
@@ -251,9 +254,9 @@ run_traceroute() {
         
         # Ограничиваем трассировку 10 хопами для ускорения
         if [[ "$cmd" == "traceroute" ]]; then
-            $cmd -m 10 -w 2 $target 2>&1 | grep -v '* * *' | head -n 15
+            "$cmd" -m 10 -w 2 "$target" 2>&1 | grep -Fv '* * *' | head -n 15
         else
-            $cmd -m 10 $target 2>&1 | grep -v '(mtu' | grep -v 'no reply' | head -n 15
+            "$cmd" -m 10 "$target" 2>&1 | grep -Fv '(mtu' | grep -Fv 'no reply' | head -n 15
         fi
     done
     echo
@@ -289,7 +292,8 @@ generate_report() {
         resolvectl dns 2>/dev/null | grep -v "Link " | sed 's/^/   /'
         
         # Проверка статуса DNSSEC
-        local dnssec_status=$(resolvectl status 2>/dev/null | grep "DNSSEC setting" | sed 's/^[[:space:]]*//')
+        local dnssec_status
+        dnssec_status=$(resolvectl status 2>/dev/null | grep "DNSSEC setting" | sed 's/^[[:space:]]*//' || true)
         if [ -n "$dnssec_status" ]; then
             echo "   $dnssec_status"
         fi
@@ -343,4 +347,6 @@ main() {
 }
 
 # Запуск скрипта
-main
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi

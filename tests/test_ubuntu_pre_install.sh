@@ -17,6 +17,7 @@ assert_false 'overflow port rejected' valid_port 65536
 assert_false 'shell input rejected as port' valid_port '22;id'
 
 SSH_CONNECTION='192.0.2.10 50000 198.51.100.5 2222'
+export SSH_CONNECTION
 if [[ "$(detect_ssh_port)" != 2222 ]]; then
     printf 'FAIL: current SSH server port was not preferred\n' >&2
     failures=$((failures + 1))

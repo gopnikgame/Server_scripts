@@ -8,6 +8,7 @@ trap 'rm -rf -- "$TEST_TMP"' EXIT
 
 if ! command -v python3 >/dev/null 2>&1 && command -v python.exe >/dev/null 2>&1; then
     PYTHON_BIN=python.exe
+    export PYTHON_BIN
 fi
 
 # shellcheck source=../setup_proxy.sh
@@ -29,12 +30,15 @@ assert_true 'valid VLESS REALITY TCP accepted' validate_vless_params
 [[ "$VLESS_REMARK" == stable ]] || failures=$((failures + 1))
 
 VLESS_PORT=70000
+export VLESS_PORT
 assert_false 'invalid VLESS port rejected' validate_vless_params
 
 PROXY_STATE_FILE="$TEST_TMP/proxy.conf"
 save_proxy_state 'http' 'http://alice:p%40ss@example.test:3128' $'value"; touch /tmp/not-created; #'
 [[ $(stat -c '%a' "$PROXY_STATE_FILE") == 600 ]] || failures=$((failures + 1))
 unset PROXY_MODE PROXY_URL PROXY_DETAILS PROXY_CONFIGURED
+# Generated fixture path is intentionally dynamic.
+# shellcheck disable=SC1090
 source "$PROXY_STATE_FILE"
 [[ "$PROXY_URL" == 'http://alice:p%40ss@example.test:3128' ]] || failures=$((failures + 1))
 [[ "$PROXY_DETAILS" == $'value"; touch /tmp/not-created; #' ]] || failures=$((failures + 1))

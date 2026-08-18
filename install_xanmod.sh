@@ -231,7 +231,10 @@ configure_proxy_interactive() {
     esac
     export http_proxy="$PROXY_ADDR" https_proxy="$PROXY_ADDR"
     export HTTP_PROXY="$PROXY_ADDR" HTTPS_PROXY="$PROXY_ADDR"
-    export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="$no_proxy"
+    no_proxy="localhost,127.0.0.1,::1"
+    export no_proxy
+    NO_PROXY="$no_proxy"
+    export NO_PROXY
     mkdir -p "$(dirname "$APT_PROXY_CONFIG")"
     printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$PROXY_ADDR" "$PROXY_ADDR" > "$APT_PROXY_CONFIG"
     chmod 600 "$APT_PROXY_CONFIG"

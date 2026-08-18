@@ -58,7 +58,8 @@ preflight() {
 }
 
 create_snapshot() {
-    local dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+    local dir
+    dir="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
     install -d -m 0700 "$dir"
     dpkg-query -W -f='${binary:Package}\t${Version}\n' > "$dir/packages.tsv"
     apt-mark showmanual > "$dir/manual-packages.txt"
@@ -126,7 +127,8 @@ disable_legacy() {
     legacy_present || { print_success "Файлы старой версии не найдены."; return 0; }
     print_warning "Будут отключены старый cron, runner и глобальный APT force-yes. Старый журнал сохранится."
     confirm "Создать резервную копию и отключить старую версию?" || return 0
-    local dir="$BACKUP_ROOT/legacy-$(date +%Y%m%d-%H%M%S)" file
+    local dir file
+    dir="$BACKUP_ROOT/legacy-$(date +%Y%m%d-%H%M%S)"
     install -d -m 0700 "$dir"
     for file in "$LEGACY_CRON" "$LEGACY_RUNNER" "$LEGACY_CONFIG" "$LEGACY_APT_CONFIG"; do
         if [[ -e "$file" ]]; then

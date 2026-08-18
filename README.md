@@ -1,13 +1,13 @@
 # 🚀 Server Scripts Manager
 
-![Launcher](https://img.shields.io/badge/launcher-v1.0.7-blue)
+![Launcher](https://img.shields.io/badge/launcher-v1.1.0-blue)
 ![Proxy](https://img.shields.io/badge/proxy--manager-v1.3.0--test-blueviolet)
-![Updated](https://img.shields.io/badge/updated-2026--08--14-green)
+![Updated](https://img.shields.io/badge/updated-2026--08--18-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04-orange)
 
 Модульный комплекс bash-скриптов для первоначальной настройки и оптимизации Ubuntu 24.04 серверов.  
-Все модули загружаются автоматически с GitHub и запускаются через единое интерактивное меню.
+При каждом запуске launcher определяет свежий commit ветки `main`, загружает все модули из этого единого snapshot, проверяет их через `bash -n` и запускает через интерактивное меню.
 
 ## ⚡ Быстрый старт
 
@@ -399,4 +399,4 @@ MIT License © 2025 [gopnikgame](https://github.com/gopnikgame)
 
 ---
 
-**Launcher:** v1.0.7 · **Proxy Manager:** v1.2.0 · **Дата:** 2026-08-14 · **Автор:** gopnikgame
+**Launcher:** v1.1.0 · **Proxy Manager:** v1.3.0 · **Дата:** 2026-08-18 · **Автор:** gopnikgame

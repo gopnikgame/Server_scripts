@@ -6,8 +6,6 @@ set -Eeuo pipefail
 
 # Метаданные скрипта
 SCRIPT_VERSION="1.2.0"
-SCRIPT_DATE="2026-08-14"
-SCRIPT_AUTHOR="gopnikgame"
 
 # Цветовые коды
 RED='\033[0;31m'
@@ -44,6 +42,12 @@ print_warning() {
     echo -e "${YELLOW}!${NC} $1"
 }
 
+confirm() {
+    local answer
+    read -r -p "$1 [y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
 # Константы
 BACKUP_DIR="/root/config_backup_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/system_setup.log"
@@ -53,7 +57,8 @@ MIN_FREE_SPACE_KB=2097152  # 2GB в килобайтах
 log() {
     local level="$1"
     shift
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     case "$level" in
         "INFO") local color=$GREEN ;;
         "WARNING") local color=$YELLOW ;;
@@ -109,7 +114,8 @@ trap transaction_error ERR
 
 # Проверка свободного места на диске
 check_free_space() {
-    local free_space_kb=$(df -k --output=avail "$PWD" | tail -n1)
+    local free_space_kb
+    free_space_kb=$(df -k --output=avail "$PWD" | tail -n1)
     if [ "$free_space_kb" -lt "$MIN_FREE_SPACE_KB" ]; then
         log "ERROR" "Недостаточно свободного места на диске. Требуется минимум $((MIN_FREE_SPACE_KB / 1024)) MB."
         exit 1
@@ -237,7 +243,7 @@ install_dependencies_and_update_system() {
     
     # Обновление списка пакетов
     print_step "Обновление списков пакетов..."
-    apt update
+    apt-get update
     
     # Проверка наличия пакетов и установка недостающих
     print_step "Проверка наличия зависимостей..."
@@ -252,7 +258,7 @@ install_dependencies_and_update_system() {
     # Если есть пакеты для установки
     if [ ${#packages_to_install[@]} -gt 0 ]; then
         print_step "Установка недостающих пакетов: ${packages_to_install[*]}"
-        apt install -y "${packages_to_install[@]}"
+        apt-get install -y "${packages_to_install[@]}"
         print_success "Зависимости установлены."
         log "INFO" "Установлены пакеты: ${packages_to_install[*]}"
     else
@@ -262,26 +268,36 @@ install_dependencies_and_update_system() {
     
     # Обновление системы
     print_step "Обновление системы..."
-    apt upgrade -y
-    apt dist-upgrade -y
+    apt-get upgrade --with-new-pkgs --no-remove -y
     log "INFO" "Система обновлена."
     
     # Очистка системы после обновления
     print_step "Очистка системы после обновления..."
     
     # Запоминаем свободное место до очистки
-    local free_space_before=$(df -h / | awk 'NR==2 {print $4}')
+    local free_space_before free_space_after
+    free_space_before=$(df -h / | awk 'NR==2 {print $4}')
     
     # Удаление устаревших пакетов
-    print_step "Удаление неиспользуемых пакетов..."
-    apt autoremove -y
+    print_step "Предварительный просмотр autoremove..."
+    local autoremove_plan removals
+    autoremove_plan=$(apt-get -s autoremove)
+    printf '%s\n' "$autoremove_plan"
+    removals=$(sed -n 's/^Remv \([^ ]*\).*/\1/p' <<< "$autoremove_plan")
+    if grep -Eq '^(linux-(image|headers|modules)|linux-xanmod|grub|systemd|openssh-server|xray)' <<< "$removals"; then
+        print_warning "autoremove предлагает удалить защищённый пакет; операция пропущена."
+    elif [[ -n "$removals" ]] && confirm "Применить показанный autoremove?"; then
+        apt-get autoremove -y
+    else
+        print_step "autoremove пропущен."
+    fi
     
     # Очистка архивов пакетов
     print_step "Очистка устаревших архивов пакетов..."
-    apt autoclean
+    apt-get autoclean
     
     # Проверка свободного места после очистки
-    local free_space_after=$(df -h / | awk 'NR==2 {print $4}')
+    free_space_after=$(df -h / | awk 'NR==2 {print $4}')
     
     print_success "Система успешно обновлена и очищена."
     log "INFO" "Система успешно обновлена и очищена. Свободно места: $free_space_after (было: $free_space_before)"
@@ -295,7 +311,8 @@ install_dependencies_and_update_system() {
     echo -e "\n${CYAN}Версии ключевых компонентов:${NC}"
     for pkg in "${key_packages[@]}"; do
         if command -v "$pkg" &> /dev/null; then
-            local version=$($pkg --version 2>&1 | head -n 1)
+            local version
+            version=$("$pkg" --version 2>&1 | head -n 1)
             echo -e "${GREEN}✓${NC} $pkg: $version"
         else
             echo -e "${RED}✘${NC} $pkg: не установлен"
@@ -305,7 +322,8 @@ install_dependencies_and_update_system() {
     # Проверяем установленный пакет для информации о системе
     if [ -n "$system_info_package" ]; then
         if command -v "$system_info_package" &> /dev/null; then
-            local info_version=$($system_info_package --version 2>&1 | head -n 1)
+            local info_version
+            info_version=$("$system_info_package" --version 2>&1 | head -n 1)
             echo -e "${GREEN}✓${NC} $system_info_package: $info_version"
         fi
     fi
@@ -328,26 +346,48 @@ install_dnscrypt() {
         print_error "Требуется установить зависимости (curl) перед установкой DNSCrypt."
         return 1
     fi
-    
-    # URL скрипта установки
-    local DNSCRYPT_INSTALL_URL="https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/main/quick_install.sh"
+    # Resolve current main once, then download the installer from that exact snapshot.
+    local dnscrypt_api="https://api.github.com/repos/gopnikgame/Installer_dnscypt"
+    local dnscrypt_commit response
+    response=$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' \
+        "$dnscrypt_api/commits/main") || {
+        print_error "Не удалось определить свежий commit DNSCrypt installer."
+        return 1
+    }
+    dnscrypt_commit=$(sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' <<< "$response" | head -n 1)
+    [[ "$dnscrypt_commit" =~ ^[0-9a-f]{40}$ ]] || {
+        print_error "GitHub API вернул некорректный commit DNSCrypt installer."
+        return 1
+    }
+    local dnscrypt_install_url="https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/${dnscrypt_commit}/quick_install.sh"
     
     print_step "Загрузка скрипта установки DNSCrypt..."
     
     # Создаем временную директорию
-    local temp_dir=$(mktemp -d)
+    local temp_dir
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/dnscrypt-install.XXXXXX")
     local install_script="$temp_dir/dnscrypt_install.sh"
     
     # Скачиваем скрипт
-    if curl -fsSL "$DNSCRYPT_INSTALL_URL" -o "$install_script"; then
+    if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --connect-timeout 10 --max-time 60 "$dnscrypt_install_url" -o "$install_script"; then
         log "INFO" "Скрипт установки успешно загружен."
         print_success "Скрипт установки загружен."
     else
         log "ERROR" "Не удалось загрузить скрипт установки DNSCrypt."
         print_error "Ошибка загрузки скрипта. Проверьте подключение к интернету."
-        rm -rf "$temp_dir"
+        rm -rf -- "$temp_dir"
         return 1
     fi
+
+    if ! bash -n "$install_script"; then
+        print_error "DNSCrypt installer не прошёл bash -n."
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    log "INFO" "DNSCrypt installer получен из commit ${dnscrypt_commit}."
     
     # Делаем скрипт исполняемым
     chmod +x "$install_script"
@@ -362,12 +402,12 @@ install_dnscrypt() {
     else
         log "ERROR" "Ошибка при установке DNSCrypt-proxy."
         print_error "Произошла ошибка при установке DNSCrypt."
-        rm -rf "$temp_dir"
+        rm -rf -- "$temp_dir"
         return 1
     fi
     
     # Очищаем временные файлы
-    rm -rf "$temp_dir"
+    rm -rf -- "$temp_dir"
     
     echo
     print_step "Дальнейшая настройка DNS будет выполняться через DNSCrypt-proxy."
