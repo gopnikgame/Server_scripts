@@ -32,15 +32,25 @@ fi
 assert_false 'invalid octets rejected' valid_ip_or_cidr 999.999.999.999
 assert_false 'shell whitespace rejected' valid_ip_or_cidr '192.0.2.1; id'
 
-dropin="$(render_ssh_dropin)"
+dropin="$(render_ssh_dropin no)"
 grep -q '^PermitRootLogin prohibit-password$' <<< "$dropin" || failures=$((failures + 1))
 grep -q '^PubkeyAuthentication yes$' <<< "$dropin" || failures=$((failures + 1))
 grep -q '^PasswordAuthentication no$' <<< "$dropin" || failures=$((failures + 1))
 grep -q '^KbdInteractiveAuthentication no$' <<< "$dropin" || failures=$((failures + 1))
+grep -q '^AllowTcpForwarding no$' <<< "$dropin" || failures=$((failures + 1))
 if grep -q '^Protocol ' <<< "$dropin"; then
     printf 'FAIL: obsolete Protocol directive present\n' >&2
     failures=$((failures + 1))
 fi
+
+for forwarding_mode in yes local remote no; do
+    dropin="$(render_ssh_dropin "$forwarding_mode")"
+    grep -q "^AllowTcpForwarding $forwarding_mode$" <<< "$dropin" || {
+        printf 'FAIL: AllowTcpForwarding %s was not rendered\n' "$forwarding_mode" >&2
+        failures=$((failures + 1))
+    }
+done
+assert_false 'invalid TCP forwarding mode rejected' render_ssh_dropin 'yes; Match all'
 
 backup_line=$(grep -n 'cp -a /etc/ufw.*BACKUP_DIR/ufw' "$ROOT_DIR/ubuntu_pre_install.sh" | head -n1 | cut -d: -f1)
 reset_line=$(grep -n 'ufw --force reset' "$ROOT_DIR/ubuntu_pre_install.sh" | head -n1 | cut -d: -f1)

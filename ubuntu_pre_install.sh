@@ -191,7 +191,9 @@ current_ssh_client_ip() {
 }
 
 render_ssh_dropin() {
-    cat <<'EOF'
+    local tcp_forwarding="${1:-no}"
+    case "$tcp_forwarding" in yes|local|remote|no) ;; *) return 2 ;; esac
+    cat <<EOF
 # Managed by Server_scripts ubuntu_pre_install.sh
 PermitRootLogin prohibit-password
 PubkeyAuthentication yes
@@ -200,7 +202,7 @@ KbdInteractiveAuthentication no
 X11Forwarding no
 MaxAuthTries 3
 AllowAgentForwarding no
-AllowTcpForwarding no
+AllowTcpForwarding $tcp_forwarding
 LoginGraceTime 30
 EOF
 }
@@ -669,6 +671,23 @@ configure_ssh() {
         return 1
     }
 
+    local tcp_forwarding_choice tcp_forwarding_mode
+    print_header "SSH TCP FORWARDING"
+    echo "1) Разрешить все туннели (yes): ssh -L, ssh -R и ssh -D"
+    echo "2) Разрешить локальные туннели (local): ssh -L и ssh -D; запретить ssh -R"
+    echo "3) Запретить все TCP-туннели (no)"
+    echo
+    while true; do
+        read -r -p "Выберите режим AllowTcpForwarding [1-3, Enter=2]: " tcp_forwarding_choice
+        case "${tcp_forwarding_choice:-2}" in
+            1) tcp_forwarding_mode="yes"; break ;;
+            2) tcp_forwarding_mode="local"; break ;;
+            3) tcp_forwarding_mode="no"; break ;;
+            *) print_error "Введите 1, 2 или 3." ;;
+        esac
+    done
+    print_step "Будет применено: AllowTcpForwarding $tcp_forwarding_mode"
+
     mkdir -p /etc/ssh/sshd_config.d
     cp -a /etc/ssh/sshd_config "$BACKUP_DIR/sshd_config"
     if [[ -f /etc/ssh/sshd_config.d/00-server-scripts.conf ]]; then
@@ -678,7 +697,7 @@ configure_ssh() {
     fi
     ROLLBACK_KIND=ssh; ROLLBACK_ACTIVE=1
 
-    render_ssh_dropin > /etc/ssh/sshd_config.d/00-server-scripts.conf
+    render_ssh_dropin "$tcp_forwarding_mode" > /etc/ssh/sshd_config.d/00-server-scripts.conf
     chmod 0644 /etc/ssh/sshd_config.d/00-server-scripts.conf
     sshd -t
 
@@ -688,6 +707,7 @@ configure_ssh() {
     grep -q '^pubkeyauthentication yes$' <<< "$effective"
     grep -q '^passwordauthentication no$' <<< "$effective"
     grep -q '^kbdinteractiveauthentication no$' <<< "$effective"
+    grep -q "^allowtcpforwarding $tcp_forwarding_mode$" <<< "$effective"
     systemctl reload ssh
     systemctl is-active --quiet ssh
 
