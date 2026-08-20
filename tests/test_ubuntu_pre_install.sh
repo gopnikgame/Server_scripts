@@ -117,10 +117,26 @@ grep -q '\[\[ "$firewall_mode" == 2 \]\]' "$ROOT_DIR/ubuntu_pre_install.sh" || {
     printf 'FAIL: UFW reset is not gated by explicit replace mode\n' >&2
     failures=$((failures + 1))
 }
+grep -Fq 'if [[ "$firewall_mode" == 2 ]] || (( UFW_WAS_ACTIVE == 0 )); then' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: replace mode does not re-enable UFW before verification\n' >&2
+    failures=$((failures + 1))
+}
+grep -q 'if (( rc == 0 )); then' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: a user-requested rollback is still logged as an execution error\n' >&2
+    failures=$((failures + 1))
+}
 if grep -q 'Выполнить все задачи автоматически' "$ROOT_DIR/ubuntu_pre_install.sh"; then
     printf 'FAIL: obsolete automatic profile is still present\n' >&2
     failures=$((failures + 1))
 fi
+grep -q 'if ! read -r -p "Вторая SSH-сессия успешно подключилась?' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: UFW confirmation EOF is not handled safely\n' >&2
+    failures=$((failures + 1))
+}
+grep -q 'if ! read -r -p "Вход по ключу во второй сессии успешен?' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: SSH confirmation EOF is not handled safely\n' >&2
+    failures=$((failures + 1))
+}
 
 if (( failures > 0 )); then
     printf '%d pre-install test(s) failed\n' "$failures" >&2

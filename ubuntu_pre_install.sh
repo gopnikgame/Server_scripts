@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 # Метаданные скрипта
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 
 # Цветовые коды
 RED='\033[0;31m'
@@ -79,7 +79,11 @@ rollback() {
     local rc="${1:-1}"
     trap - ERR
     (( ROLLBACK_ACTIVE == 1 )) || return "$rc"
-    log "ERROR" "Ошибка во время настройки ${ROLLBACK_KIND}. Восстанавливаем исходную конфигурацию."
+    if (( rc == 0 )); then
+        log "WARNING" "Изменения ${ROLLBACK_KIND} не подтверждены. Восстанавливаем исходную конфигурацию."
+    else
+        log "ERROR" "Ошибка во время настройки ${ROLLBACK_KIND}. Восстанавливаем исходную конфигурацию."
+    fi
     case "$ROLLBACK_KIND" in
         ufw)
             if [[ -d "$BACKUP_DIR/ufw" ]]; then
@@ -556,14 +560,18 @@ configure_firewall() {
             ufw allow "$port/tcp"
         fi
     done
-    if (( UFW_WAS_ACTIVE == 0 )); then
+    # Replace mode disables UFW before reset, so it must always be enabled again
+    # for the mandatory second-session check, regardless of its initial state.
+    if [[ "$firewall_mode" == 2 ]] || (( UFW_WAS_ACTIVE == 0 )); then
         ufw --dry-run enable >/dev/null
         ufw --force enable
     fi
     ufw status numbered
 
     print_warning "Не закрывайте эту сессию. Откройте вторую SSH-сессию и проверьте вход."
-    read -r -p "Вторая SSH-сессия успешно подключилась? [y/N]: " value
+    if ! read -r -p "Вторая SSH-сессия успешно подключилась? [y/N]: " value; then
+        value=""
+    fi
     if [[ "$value" =~ ^[Yy]$ ]]; then
         ROLLBACK_ACTIVE=0; ROLLBACK_KIND=""
         log "INFO" "UFW применён и подтверждён второй SSH-сессией. Резервная копия: $BACKUP_DIR/ufw"
@@ -758,7 +766,9 @@ configure_ssh() {
 
     print_warning "Не закрывайте текущую сессию. Откройте вторую SSH-сессию тем же ключом."
     local confirmed
-    read -r -p "Вход по ключу во второй сессии успешен? [y/N]: " confirmed
+    if ! read -r -p "Вход по ключу во второй сессии успешен? [y/N]: " confirmed; then
+        confirmed=""
+    fi
     if [[ "$confirmed" =~ ^[Yy]$ ]]; then
         ROLLBACK_ACTIVE=0; ROLLBACK_KIND=""
         log "INFO" "Конфигурация SSH проверена sshd -t, перезагружена и подтверждена второй сессией."
