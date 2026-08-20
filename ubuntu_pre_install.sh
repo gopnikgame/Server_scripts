@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 # Метаданные скрипта
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 
 # Цветовые коды
 RED='\033[0;31m'
@@ -207,41 +207,81 @@ LoginGraceTime 30
 EOF
 }
 
+package_is_installed() {
+    local status
+    status=$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true)
+    [[ "$status" == ii* ]]
+}
+
+first_output_line() {
+    local output
+    output=$("$@" 2>&1) || return 1
+    printf '%s\n' "${output%%$'\n'*}"
+}
+
+package_version_line() {
+    case "$1" in
+        curl) first_output_line curl --version ;;
+        wget) first_output_line wget --version ;;
+        git) first_output_line git --version ;;
+        openssh-server) first_output_line sshd -V ;;
+        mtr|mtr-tiny) first_output_line mtr --version ;;
+        *) return 1 ;;
+    esac
+}
+
+pin_dnscrypt_installer_snapshot() {
+    local installer="$1" commit="$2"
+    [[ -f "$installer" && "$commit" =~ ^[0-9a-f]{40}$ ]] || return 2
+    sed -i "s#https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/main/#https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/${commit}/#g" "$installer"
+    ! grep -q 'https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/main/' "$installer"
+}
+
+normalize_dnscrypt_manager_entrypoint() {
+    local main_script="$1" candidate line replaced=0
+    local expected='SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+    [[ -f "$main_script" ]] || return 2
+    if grep -Fq 'source_path=$(readlink -f "$1")' "$main_script" || \
+        grep -Fq 'SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"' "$main_script"; then
+        return 0
+    fi
+    candidate=$(mktemp "${main_script}.candidate.XXXXXX")
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$expected" ]]; then
+            printf '%s\n' 'SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"' \
+                'SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"' >> "$candidate"
+            ((replaced += 1))
+        else
+            printf '%s\n' "$line" >> "$candidate"
+        fi
+    done < "$main_script"
+    if (( replaced != 1 )) || ! bash -n "$candidate"; then
+        rm -f -- "$candidate"
+        return 1
+    fi
+    chmod --reference="$main_script" "$candidate"
+    mv -f -- "$candidate" "$main_script"
+}
+
 # Установка зависимостей и обновление системы
 install_dependencies_and_update_system() {
     log "INFO" "Установка зависимостей и обновление системы..."
     print_header "Установка зависимых пакетов и обновление системы"
     
-    # Базовый список пакетов (без neofetch/fastfetch)
+    # Только серверные инструменты. Декоративные neofetch/fastfetch намеренно
+    # не устанавливаются: на минимальном образе они могут тянуть GUI-зависимости.
+    local mtr_package="mtr"
+    if package_is_installed mtr-tiny; then
+        mtr_package="mtr-tiny"
+    fi
     local base_packages=(
         curl wget git mc
         net-tools nmap tcpdump iotop
         unzip tar vim tmux screen
         rsync ncdu dnsutils
         whois ufw openssh-server
-        mtr htop
+        "$mtr_package" htop
     )
-    
-    # Определяем, какой пакет для информации о системе доступен
-    local system_info_package=""
-    
-    # Проверяем, доступен ли fastfetch в репозиториях
-    if apt-cache show fastfetch &>/dev/null; then
-        system_info_package="fastfetch"
-        log "INFO" "Найден пакет fastfetch в репозиториях"
-    # Если fastfetch нет, проверяем neofetch
-    elif apt-cache show neofetch &>/dev/null; then
-        system_info_package="neofetch"
-        log "INFO" "Найден пакет neofetch в репозиториях"
-    else
-        log "WARNING" "Ни fastfetch, ни neofetch не доступны для установки. Пропускаем."
-    fi
-    
-    # Формируем финальный список пакетов
-    local required_packages=("${base_packages[@]}")
-    if [ -n "$system_info_package" ]; then
-        required_packages+=("$system_info_package")
-    fi
     
     # Обновление списка пакетов
     print_step "Обновление списков пакетов..."
@@ -251,14 +291,24 @@ install_dependencies_and_update_system() {
     print_step "Проверка наличия зависимостей..."
     local packages_to_install=()
     
-    for package in "${required_packages[@]}"; do
-        if ! dpkg -l | grep -q "^ii  $package "; then
+    for package in "${base_packages[@]}"; do
+        if ! package_is_installed "$package"; then
             packages_to_install+=("$package")
         fi
     done
     
     # Если есть пакеты для установки
     if [ ${#packages_to_install[@]} -gt 0 ]; then
+        local install_plan install_removals
+        print_step "Предварительная проверка плана установки..."
+        install_plan=$(apt-get -s install -- "${packages_to_install[@]}")
+        printf '%s\n' "$install_plan"
+        install_removals=$(sed -n 's/^Remv \([^ ]*\).*/\1/p' <<< "$install_plan")
+        if [[ -n "$install_removals" ]]; then
+            print_error "Установка требует удаления пакетов; операция остановлена."
+            log "ERROR" "План установки требует удаления: ${install_removals//$'\n'/, }"
+            return 1
+        fi
         print_step "Установка недостающих пакетов: ${packages_to_install[*]}"
         apt-get install -y "${packages_to_install[@]}"
         print_success "Зависимости установлены."
@@ -308,35 +358,25 @@ install_dependencies_and_update_system() {
     print_step "Проверка установленных версий..."
     
     # Основные пакеты, версии которых стоит проверить
-    local key_packages=("curl" "wget" "git" "openssh-server" "mtr")
+    local key_packages=("curl" "wget" "git" "openssh-server" "$mtr_package")
     
     echo -e "\n${CYAN}Версии ключевых компонентов:${NC}"
     for pkg in "${key_packages[@]}"; do
-        if command -v "$pkg" &> /dev/null; then
-            local version
-            version=$("$pkg" --version 2>&1 | head -n 1)
+        local version
+        if version=$(package_version_line "$pkg"); then
             echo -e "${GREEN}✓${NC} $pkg: $version"
         else
             echo -e "${RED}✘${NC} $pkg: не установлен"
         fi
     done
     
-    # Проверяем установленный пакет для информации о системе
-    if [ -n "$system_info_package" ]; then
-        if command -v "$system_info_package" &> /dev/null; then
-            local info_version
-            info_version=$("$system_info_package" --version 2>&1 | head -n 1)
-            echo -e "${GREEN}✓${NC} $system_info_package: $info_version"
-        fi
-    fi
-    
     echo 
     return 0
 }
-# Установка DNSCrypt через внешний скрипт
+# Установка DNSCrypt Manager через внешний скрипт
 install_dnscrypt() {
-    log "INFO" "Установка DNSCrypt-proxy..."
-    print_header "Установка DNSCrypt-proxy"
+    log "INFO" "Установка DNSCrypt Manager..."
+    print_header "Установка DNSCrypt Manager"
     
     print_step "DNSCrypt-proxy обеспечивает шифрование DNS-запросов"
     print_step "и защиту от прослушивания и подмены DNS-ответов."
@@ -384,6 +424,11 @@ install_dnscrypt() {
         return 1
     fi
 
+    if ! pin_dnscrypt_installer_snapshot "$install_script" "$dnscrypt_commit"; then
+        print_error "Не удалось зафиксировать зависимости DNSCrypt installer на commit ${dnscrypt_commit}."
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
     if ! bash -n "$install_script"; then
         print_error "DNSCrypt installer не прошёл bash -n."
         rm -rf -- "$temp_dir"
@@ -398,12 +443,12 @@ install_dnscrypt() {
     echo
     
     # Запускаем скрипт установки
-    if bash "$install_script"; then
-        log "INFO" "DNSCrypt-proxy успешно установлен."
-        print_success "DNSCrypt-proxy успешно установлен и настроен."
+    if bash "$install_script" && normalize_dnscrypt_manager_entrypoint /usr/local/dnscrypt-scripts/main.sh; then
+        log "INFO" "DNSCrypt Manager успешно установлен из commit ${dnscrypt_commit}."
+        print_success "DNSCrypt Manager установлен. Сам DNSCrypt-proxy настраивается через dnscrypt_manager."
     else
-        log "ERROR" "Ошибка при установке DNSCrypt-proxy."
-        print_error "Произошла ошибка при установке DNSCrypt."
+        log "ERROR" "Ошибка при установке DNSCrypt Manager."
+        print_error "Произошла ошибка при установке DNSCrypt Manager."
         rm -rf -- "$temp_dir"
         return 1
     fi
@@ -412,7 +457,7 @@ install_dnscrypt() {
     rm -rf -- "$temp_dir"
     
     echo
-    print_step "Дальнейшая настройка DNS будет выполняться через DNSCrypt-proxy."
+    print_step "Запустите dnscrypt_manager для установки и настройки DNSCrypt-proxy."
     
     return 0
 }
@@ -917,7 +962,7 @@ show_menu() {
         # Выводим пункты меню
         echo -e "$i) ${GREEN}Установить зависимости и обновить систему${NC}"
         ((i++))
-        echo -e "$i) ${GREEN}Установить DNSCrypt-proxy${NC}"
+        echo -e "$i) ${GREEN}Установить DNSCrypt Manager${NC}"
         ((i++))
         echo -e "$i) ${GREEN}Настроить файрволл (UFW)${NC}"
         ((i++))

@@ -16,6 +16,56 @@ assert_false 'zero port rejected' valid_port 0
 assert_false 'overflow port rejected' valid_port 65536
 assert_false 'shell input rejected as port' valid_port '22;id'
 
+(
+    dpkg-query() { printf 'ii '; }
+    package_is_installed example
+) || {
+    printf 'FAIL: installed package status was not recognized\n' >&2
+    failures=$((failures + 1))
+}
+(
+    dpkg-query() { printf 'un '; }
+    ! package_is_installed example
+) || {
+    printf 'FAIL: uninstalled package status was accepted\n' >&2
+    failures=$((failures + 1))
+}
+
+if grep -Eq 'apt-cache show (neo|fast)fetch|required_packages\+=\("\$system_info_package"\)' "$ROOT_DIR/ubuntu_pre_install.sh"; then
+    printf 'FAIL: decorative system-info packages must not be auto-installed\n' >&2
+    failures=$((failures + 1))
+fi
+grep -q 'apt-get -s install -- "${packages_to_install\[@\]}"' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: package installation is not simulated before mutation\n' >&2
+    failures=$((failures + 1))
+}
+grep -q 'package_is_installed mtr-tiny' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: an existing mtr-tiny installation is not preserved\n' >&2
+    failures=$((failures + 1))
+}
+
+dnscrypt_fixture=$(mktemp)
+trap 'rm -f "$dnscrypt_fixture"' EXIT
+printf '%s\n' 'https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/main/lib/common.sh' > "$dnscrypt_fixture"
+dnscrypt_commit=1111111111111111111111111111111111111111
+assert_true 'DNSCrypt snapshot pinned' pin_dnscrypt_installer_snapshot "$dnscrypt_fixture" "$dnscrypt_commit"
+grep -q "/${dnscrypt_commit}/lib/common.sh" "$dnscrypt_fixture" || {
+    printf 'FAIL: DNSCrypt installer dependency URL was not pinned\n' >&2
+    failures=$((failures + 1))
+}
+assert_false 'invalid DNSCrypt commit rejected' pin_dnscrypt_installer_snapshot "$dnscrypt_fixture" main
+
+dnscrypt_main_fixture=$(mktemp)
+trap 'rm -f "$dnscrypt_fixture" "$dnscrypt_main_fixture"' EXIT
+printf '%s\n' '#!/usr/bin/env bash' 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"' > "$dnscrypt_main_fixture"
+chmod 0755 "$dnscrypt_main_fixture"
+assert_true 'DNSCrypt entrypoint normalized' normalize_dnscrypt_manager_entrypoint "$dnscrypt_main_fixture"
+grep -q '^SCRIPT_PATH="$(readlink -f "${BASH_SOURCE\[0\]}")"$' "$dnscrypt_main_fixture" || {
+    printf 'FAIL: DNSCrypt entrypoint does not resolve its symlink\n' >&2
+    failures=$((failures + 1))
+}
+assert_true 'already normalized entrypoint accepted' normalize_dnscrypt_manager_entrypoint "$dnscrypt_main_fixture"
+
 SSH_CONNECTION='192.0.2.10 50000 198.51.100.5 2222'
 export SSH_CONNECTION
 if [[ "$(detect_ssh_port)" != 2222 ]]; then
