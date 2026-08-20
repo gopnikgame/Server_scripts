@@ -1,12 +1,12 @@
 #!/bin/bash
 
-# Version: 2.0.0
-# Description: Read-only XanMod/BBR/VLESS TCP status monitor
+# Version: 2.1.0
+# Description: Read-only kernel BBR/VLESS TCP status monitor
 
 set -u
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
-readonly PROFILE_FILE="/etc/sysctl.d/99-xanmod-vless-tcp.conf"
+readonly PROFILE_FILE="/etc/sysctl.d/90-server-scripts-vless-tcp.conf"
 
 value_or_unknown() {
     sysctl -n "$1" 2>/dev/null || printf 'unknown\n'
@@ -14,7 +14,7 @@ value_or_unknown() {
 
 show_status() {
     clear
-    printf '%b=== XanMod / BBR / VLESS TCP ===%b\n\n' "$BLUE" "$NC"
+    printf '%b=== Kernel / BBR / VLESS TCP ===%b\n\n' "$BLUE" "$NC"
     printf 'Ядро:                    %s\n' "$(uname -r)"
     printf 'Доступные алгоритмы:     %s\n' "$(value_or_unknown net.ipv4.tcp_available_congestion_control)"
     printf 'Активный алгоритм:       %s\n' "$(value_or_unknown net.ipv4.tcp_congestion_control)"
@@ -29,10 +29,13 @@ show_status() {
     printf '\n%bОчереди интерфейсов:%b\n' "$YELLOW" "$NC"
     tc -s qdisc show 2>/dev/null || printf 'Команда tc недоступна\n'
     printf '\n'
-    if [[ "$(uname -r)" == *xanmod* ]] &&
-       [[ "$(value_or_unknown net.ipv4.tcp_congestion_control)" == bbr ]] &&
-       [[ "$(value_or_unknown net.core.default_qdisc)" == fq ]]; then
-        printf '%bXanMod + BBR + fq активны.%b\n' "$GREEN" "$NC"
+    if [[ "$(value_or_unknown net.ipv4.tcp_congestion_control)" == bbr ]] &&
+        [[ "$(value_or_unknown net.core.default_qdisc)" == fq ]]; then
+        if [[ "$(uname -r)" == *xanmod* ]]; then
+            printf '%bBBR загруженной сборки XanMod + fq активны.%b\n' "$GREEN" "$NC"
+        else
+            printf '%bBBR текущего ядра + fq активны.%b\n' "$GREEN" "$NC"
+        fi
     else
         printf '%bКонфигурация не полностью соответствует VLESS TCP Stable.%b\n' "$YELLOW" "$NC"
     fi

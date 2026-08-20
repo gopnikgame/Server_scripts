@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 # Метаданные скрипта
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.3.0"
 
 # Цветовые коды
 RED='\033[0;31m'
@@ -52,6 +52,10 @@ confirm() {
 BACKUP_DIR="/root/config_backup_$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/system_setup.log"
 MIN_FREE_SPACE_KB=2097152  # 2GB в килобайтах
+VLESS_SYSCTL_CONFIG="${VLESS_SYSCTL_CONFIG:-/etc/sysctl.d/90-server-scripts-vless-tcp.conf}"
+VLESS_LEGACY_CONFIG="${VLESS_LEGACY_CONFIG:-/etc/sysctl.d/99-xanmod-vless-tcp.conf}"
+VLESS_MODULE_CONFIG="${VLESS_MODULE_CONFIG:-/etc/modules-load.d/90-server-scripts-bbr.conf}"
+VLESS_BACKUP_DIR="${VLESS_BACKUP_DIR:-/var/backups/server-scripts/vless-tcp}"
 
 # Функция логирования с цветным выводом
 log() {
@@ -779,22 +783,198 @@ configure_ssh() {
     fi
 }
 
-# Системные твики
-apply_system_tweaks() {
-    log "INFO" "Применение системных твиков..."
+# Профиль VLESS/REALITY с большим количеством TCP-соединений.
+vless_buffer_limit_for_ram() {
+    local ram_mb="$1"
+    # MemTotal is lower than nominal VM RAM because firmware/kernel reserve memory.
+    if (( ram_mb < 768 )); then printf '%s\n' 8388608
+    elif (( ram_mb < 3584 )); then printf '%s\n' 16777216
+    elif (( ram_mb < 7680 )); then printf '%s\n' 33554432
+    else printf '%s\n' 67108864
+    fi
+}
 
-    # Оптимизация TCP/IP стека
-    cat >> /etc/sysctl.conf << EOF
-# Оптимизация сети
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 2048
-net.ipv4.tcp_max_tw_buckets = 720000
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_window_scaling = 1
+vless_max_current_or() {
+    local key="$1" wanted="$2" current
+    current=$(sysctl -n "$key" 2>/dev/null || echo 0)
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    (( current > wanted )) && printf '%s\n' "$current" || printf '%s\n' "$wanted"
+}
+
+vless_local_port_range() {
+    local low high
+    read -r low high < <(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || printf '32768 60999\n')
+    [[ "$low" =~ ^[0-9]+$ ]] || low=32768
+    [[ "$high" =~ ^[0-9]+$ ]] || high=60999
+    (( low > 10240 )) && low=10240
+    (( high < 65535 )) && high=65535
+    printf '%s %s\n' "$low" "$high"
+}
+
+vless_kernel_label() {
+    if [[ "$(uname -r)" == *xanmod* ]]; then
+        printf 'XanMod; используется реализация BBR из загруженной сборки XanMod\n'
+    else
+        printf 'Ubuntu/Linux generic; используется BBR из загруженного ядра\n'
+    fi
+}
+
+ensure_running_kernel_bbr() {
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
+}
+
+render_vless_high_connection_profile() {
+    local ram_mb="$1" buffer somax synbacklog port_range
+    buffer=$(vless_buffer_limit_for_ram "$ram_mb")
+    somax=$(vless_max_current_or net.core.somaxconn 16384)
+    synbacklog=$(vless_max_current_or net.ipv4.tcp_max_syn_backlog 16384)
+    port_range=$(vless_local_port_range)
+    cat <<EOF
+# Server_scripts: VLESS/REALITY High Connection
+# Generated: $(date -Is)
+# BBR implementation is supplied by the currently running kernel.
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_syncookies=1
+net.core.somaxconn=$somax
+net.ipv4.tcp_max_syn_backlog=$synbacklog
+net.ipv4.ip_local_port_range=$port_range
+net.core.rmem_max=$buffer
+net.core.wmem_max=$buffer
+net.ipv4.tcp_rmem=4096 131072 $buffer
+net.ipv4.tcp_wmem=4096 16384 $buffer
 EOF
-    sysctl -p
-    log "INFO" "Системные твики применены."
+}
+
+vless_profile_keys() {
+    printf '%s\n' net.core.default_qdisc net.ipv4.tcp_congestion_control \
+        net.ipv4.tcp_mtu_probing net.ipv4.tcp_syncookies net.core.somaxconn \
+        net.ipv4.tcp_max_syn_backlog net.ipv4.ip_local_port_range \
+        net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+}
+
+snapshot_vless_runtime() {
+    local target="$1" key value
+    : > "$target"
+    while IFS= read -r key; do
+        value=$(sysctl -n "$key" 2>/dev/null) || continue
+        printf '%s=%s\n' "$key" "$value" >> "$target"
+    done < <(vless_profile_keys)
+    chmod 0600 "$target"
+}
+
+validate_vless_profile() {
+    local file="$1" key
+    while IFS='=' read -r key _; do
+        [[ "$key" =~ ^[[:space:]]*# || -z "${key// }" ]] && continue
+        key="${key//[[:space:]]/}"
+        sysctl -n "$key" >/dev/null 2>&1 || { print_error "Ядро не поддерживает sysctl: $key"; return 1; }
+    done < "$file"
+}
+
+show_vless_tcp_status() {
+    print_header "VLESS/REALITY HIGH CONNECTION"
+    printf 'Ядро:                 %s\n' "$(uname -r)"
+    printf 'Реализация BBR:       %s\n' "$(vless_kernel_label)"
+    printf 'Доступные алгоритмы:  %s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
+    printf 'Активный алгоритм:    %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    printf 'Qdisc по умолчанию:   %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    printf 'SOMAXCONN:             %s\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unknown)"
+    printf 'SYN backlog:           %s\n' "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unknown)"
+    printf 'Локальные TCP-порты:  %s\n' "$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo unknown)"
+    printf 'Профиль:               %s\n' "$([[ -f "$VLESS_SYSCTL_CONFIG" ]] && echo установлен || echo не-установлен)"
+    if systemctl cat xray.service >/dev/null 2>&1; then
+        printf 'Xray LimitNOFILE:      %s\n' "$(systemctl show xray.service -p LimitNOFILE --value 2>/dev/null || echo unknown)"
+    fi
+    printf '\nСокеты:\n'; ss -s 2>/dev/null || true
+    printf '\nSYN-RECV: %s; TIME-WAIT: %s\n' \
+        "$(ss -Hnt state syn-recv 2>/dev/null | wc -l | tr -d ' ')" \
+        "$(ss -Hnt state time-wait 2>/dev/null | wc -l | tr -d ' ')"
+}
+
+apply_vless_tcp_profile() {
+    local ram_mb temporary module_temporary stamp backup runtime_backup had_current=0 had_legacy=0 had_module=0
+    ensure_running_kernel_bbr || { print_error "Загруженное ядро не предоставляет алгоритм bbr."; return 1; }
+    ram_mb=$(awk '/MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+    temporary=$(mktemp)
+    render_vless_high_connection_profile "$ram_mb" > "$temporary"
+    validate_vless_profile "$temporary" || { rm -f "$temporary"; return 1; }
+    print_header "ПЛАН VLESS/REALITY HIGH CONNECTION"
+    printf 'Ядро: %s\n' "$(vless_kernel_label)"
+    cat "$temporary"
+    confirm "Применить профиль?" || { rm -f "$temporary"; return 0; }
+
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="$VLESS_BACKUP_DIR/$stamp"
+    mkdir -p "$backup"
+    chmod 0700 "$VLESS_BACKUP_DIR" "$backup"
+    runtime_backup="$backup/runtime.conf"
+    snapshot_vless_runtime "$runtime_backup"
+    if [[ -e "$VLESS_SYSCTL_CONFIG" ]]; then cp -a "$VLESS_SYSCTL_CONFIG" "$backup/profile.conf"; had_current=1; fi
+    if [[ -e "$VLESS_LEGACY_CONFIG" ]]; then cp -a "$VLESS_LEGACY_CONFIG" "$backup/legacy.conf"; had_legacy=1; fi
+    if [[ -e "$VLESS_MODULE_CONFIG" ]]; then cp -a "$VLESS_MODULE_CONFIG" "$backup/module.conf"; had_module=1; fi
+    printf '%s %s %s\n' "$had_current" "$had_legacy" "$had_module" > "$backup/state"
+
+    install -m 0644 "$temporary" "$VLESS_SYSCTL_CONFIG"
+    module_temporary=$(mktemp)
+    printf 'tcp_bbr\n' > "$module_temporary"
+    install -m 0644 "$module_temporary" "$VLESS_MODULE_CONFIG"
+    rm -f "$module_temporary"
+    rm -f "$temporary" "$VLESS_LEGACY_CONFIG"
+    if ! sysctl -p "$VLESS_SYSCTL_CONFIG" >> "$LOG_FILE" 2>&1; then
+        print_error "Ядро отклонило профиль; выполняется откат."
+        restore_vless_tcp_backup "$backup"
+        return 1
+    fi
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == bbr ]] || { restore_vless_tcp_backup "$backup"; print_error "BBR не активировался; профиль отменён."; return 1; }
+    log "INFO" "VLESS/REALITY High Connection применён. Резервная копия: $backup"
+    print_success "Профиль применён. Резервная копия: $backup"
+    show_vless_tcp_status
+}
+
+restore_vless_tcp_backup() {
+    local backup="$1" had_current had_legacy had_module
+    [[ -f "$backup/state" && -f "$backup/runtime.conf" ]] || { print_error "Некорректная резервная копия: $backup"; return 1; }
+    read -r had_current had_legacy had_module < "$backup/state"
+    if (( had_current == 1 )); then cp -a "$backup/profile.conf" "$VLESS_SYSCTL_CONFIG"; else rm -f "$VLESS_SYSCTL_CONFIG"; fi
+    if (( had_legacy == 1 )); then cp -a "$backup/legacy.conf" "$VLESS_LEGACY_CONFIG"; else rm -f "$VLESS_LEGACY_CONFIG"; fi
+    if (( had_module == 1 )); then cp -a "$backup/module.conf" "$VLESS_MODULE_CONFIG"; else rm -f "$VLESS_MODULE_CONFIG"; fi
+    sysctl -p "$backup/runtime.conf" >> "$LOG_FILE" 2>&1
+}
+
+rollback_vless_tcp_profile() {
+    local backup
+    backup=$(find "$VLESS_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' 2>/dev/null | sort -r | head -n 1 || true)
+    [[ -n "$backup" ]] || { print_warning "Резервные копии профиля не найдены."; return 0; }
+    printf 'Будет восстановлена копия: %s\n' "$backup"
+    confirm "Выполнить откат?" || return 0
+    restore_vless_tcp_backup "$backup"
+    mv "$backup" "$backup.restored"
+    print_success "Профиль и runtime-параметры восстановлены."
+    show_vless_tcp_status
+}
+
+apply_system_tweaks() {
+    local choice
+    while true; do
+        print_header "СЕТЕВОЙ ПРОФИЛЬ VLESS/REALITY"
+        echo "1) Применить High Connection профиль (BBR обязателен)"
+        echo "2) Показать текущие параметры и нагрузку"
+        echo "3) Откатить последнее применение"
+        echo "0) Вернуться"
+        read -r -p "Выберите действие [0-3]: " choice
+        case "$choice" in
+            1) apply_vless_tcp_profile ;;
+            2) show_vless_tcp_status ;;
+            3) rollback_vless_tcp_profile ;;
+            0|'') return 0 ;;
+            *) print_error "Введите 0, 1, 2 или 3." ;;
+        esac
+        echo
+        read -r -p "Нажмите Enter для продолжения..." || return 0
+    done
 }
 
 # Проверка статуса IPv6

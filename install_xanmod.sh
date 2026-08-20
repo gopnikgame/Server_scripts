@@ -1,16 +1,17 @@
 #!/bin/bash
 
-# Version: 2.0.1
+# Version: 2.1.0
 # Description: Interactive XanMod installer for VLESS TCP servers
 # Repository: https://github.com/gopnikgame/Server_scripts
 # License: MIT
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.1.0"
 readonly LOG_FILE="${XANMOD_LOG_FILE:-/var/log/xanmod_install.log}"
 readonly STATE_FILE="${XANMOD_STATE_FILE:-/var/lib/server-scripts/xanmod.state}"
-readonly SYSCTL_CONFIG="${XANMOD_SYSCTL_CONFIG:-/etc/sysctl.d/99-xanmod-vless-tcp.conf}"
+readonly SYSCTL_CONFIG="${XANMOD_SYSCTL_CONFIG:-/etc/sysctl.d/90-server-scripts-vless-tcp.conf}"
+readonly LEGACY_SYSCTL_CONFIG="${XANMOD_LEGACY_SYSCTL_CONFIG:-/etc/sysctl.d/99-xanmod-vless-tcp.conf}"
 readonly APT_PROXY_CONFIG="${XANMOD_APT_PROXY_CONFIG:-/etc/apt/apt.conf.d/99xanmod-proxy}"
 readonly KEYRING_FILE="${XANMOD_KEYRING_FILE:-/etc/apt/keyrings/xanmod-archive-keyring.gpg}"
 readonly SOURCE_FILE="${XANMOD_SOURCE_FILE:-/etc/apt/sources.list.d/xanmod-release.list}"
@@ -43,6 +44,7 @@ profile_keys() {
         net.ipv4.tcp_syncookies \
         net.core.somaxconn \
         net.ipv4.tcp_max_syn_backlog \
+        net.ipv4.ip_local_port_range \
         net.core.rmem_max \
         net.core.wmem_max \
         net.ipv4.tcp_rmem \
@@ -364,10 +366,22 @@ install_kernel_interactive() {
 
 buffer_limit_for_ram() {
     local ram_mb="$1"
-    if (( ram_mb < 1024 )); then printf '%s\n' 8388608
-    elif (( ram_mb < 4096 )); then printf '%s\n' 16777216
-    else printf '%s\n' 33554432
+    # MemTotal is lower than nominal VM RAM because firmware/kernel reserve memory.
+    if (( ram_mb < 768 )); then printf '%s\n' 8388608
+    elif (( ram_mb < 3584 )); then printf '%s\n' 16777216
+    elif (( ram_mb < 7680 )); then printf '%s\n' 33554432
+    else printf '%s\n' 67108864
     fi
+}
+
+local_port_range_for_proxy() {
+    local low high
+    read -r low high < <(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || printf '32768 60999\n')
+    [[ "$low" =~ ^[0-9]+$ ]] || low=32768
+    [[ "$high" =~ ^[0-9]+$ ]] || high=60999
+    (( low > 10240 )) && low=10240
+    (( high < 65535 )) && high=65535
+    printf '%s %s\n' "$low" "$high"
 }
 
 max_current_or() {
@@ -378,10 +392,11 @@ max_current_or() {
 }
 
 render_vless_profile() {
-    local ram_mb="$1" buffer somax synbacklog
+    local ram_mb="$1" buffer somax synbacklog port_range
     buffer=$(buffer_limit_for_ram "$ram_mb")
-    somax=$(max_current_or net.core.somaxconn 8192)
-    synbacklog=$(max_current_or net.ipv4.tcp_max_syn_backlog 8192)
+    somax=$(max_current_or net.core.somaxconn 16384)
+    synbacklog=$(max_current_or net.ipv4.tcp_max_syn_backlog 16384)
+    port_range=$(local_port_range_for_proxy)
     cat <<EOF
 # Server_scripts: VLESS TCP Stable
 # Generated: $(date -Is)
@@ -392,6 +407,7 @@ net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_syncookies=1
 net.core.somaxconn=$somax
 net.ipv4.tcp_max_syn_backlog=$synbacklog
+net.ipv4.ip_local_port_range=$port_range
 net.core.rmem_max=$buffer
 net.core.wmem_max=$buffer
 net.ipv4.tcp_rmem=4096 131072 $buffer
@@ -413,8 +429,9 @@ apply_vless_profile() {
     require_root || return 1
     collect_system_info || return 1
     [[ "$(uname -r)" == *xanmod* ]] || { error "Сначала загрузите установленное ядро XanMod"; return 1; }
+    local temporary backup="" legacy_backup="" runtime_backup transaction had_profile=0
+    modprobe tcp_bbr 2>/dev/null || true
     sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr || { error "Загруженное ядро не предоставляет BBR"; return 1; }
-    local temporary backup="" runtime_backup
     temporary=$(mktemp)
     render_vless_profile "$RAM_MB" > "$temporary"
     validate_profile_keys "$temporary" || { rm -f "$temporary"; return 1; }
@@ -424,12 +441,20 @@ apply_vless_profile() {
     confirm "Применить этот профиль?" || { rm -f "$temporary"; return 0; }
     runtime_backup=$(backup_runtime_profile)
     log "Снимок прежних runtime sysctl: $runtime_backup"
-    [[ ! -e "$SYSCTL_CONFIG" ]] || backup=$(backup_file "$SYSCTL_CONFIG" sysctl)
+    if [[ -e "$SYSCTL_CONFIG" ]]; then backup=$(backup_file "$SYSCTL_CONFIG" sysctl); had_profile=1; fi
+    [[ ! -e "$LEGACY_SYSCTL_CONFIG" ]] || legacy_backup=$(backup_file "$LEGACY_SYSCTL_CONFIG" legacy-sysctl)
+    transaction="$BACKUP_DIR/profile-state.$(date '+%Y%m%d-%H%M%S')"
+    printf 'had_profile=%s\nprofile_backup=%s\nlegacy_backup=%s\nruntime_backup=%s\n' \
+        "$had_profile" "$backup" "$legacy_backup" "$runtime_backup" > "$transaction"
+    chmod 0600 "$transaction"
     install -m 0644 "$temporary" "$SYSCTL_CONFIG"
-    rm -f "$temporary"
+    rm -f "$temporary" "$LEGACY_SYSCTL_CONFIG"
     if ! sysctl --system >>"$LOG_FILE" 2>&1; then
         error "Применение sysctl завершилось ошибкой"
-        [[ -z "$backup" ]] || cp -a "$backup" "$SYSCTL_CONFIG"
+        if (( had_profile == 1 )); then cp -a "$backup" "$SYSCTL_CONFIG"; else rm -f "$SYSCTL_CONFIG"; fi
+        [[ -z "$legacy_backup" ]] || cp -a "$legacy_backup" "$LEGACY_SYSCTL_CONFIG"
+        sysctl -p "$runtime_backup" >>"$LOG_FILE" 2>&1 || true
+        rm -f "$transaction"
         return 1
     fi
     success "Профиль применён"
@@ -470,7 +495,23 @@ rollback_profile() {
     require_root || return 1
     header "Откат сетевого профиля"
     [[ -f "$SYSCTL_CONFIG" ]] || { warn "Активный профиль не найден"; return 0; }
-    local backups selected runtime_backup
+    local backups selected runtime_backup transaction had_profile legacy_backup profile_backup
+    transaction=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'profile-state.*' 2>/dev/null | sort -r | head -n1 || true)
+    if [[ -n "$transaction" ]]; then
+        had_profile=$(awk -F= '$1=="had_profile" {print $2}' "$transaction")
+        profile_backup=$(awk -F= '$1=="profile_backup" {sub(/^[^=]*=/, ""); print}' "$transaction")
+        legacy_backup=$(awk -F= '$1=="legacy_backup" {sub(/^[^=]*=/, ""); print}' "$transaction")
+        runtime_backup=$(awk -F= '$1=="runtime_backup" {sub(/^[^=]*=/, ""); print}' "$transaction")
+        printf 'Будет восстановлена транзакция: %s\n' "$transaction"
+        confirm "Откатить последнее применение профиля?" || return 0
+        if [[ "$had_profile" == 1 ]]; then cp -a "$profile_backup" "$SYSCTL_CONFIG"; else rm -f "$SYSCTL_CONFIG"; fi
+        if [[ -n "$legacy_backup" ]]; then cp -a "$legacy_backup" "$LEGACY_SYSCTL_CONFIG"; else rm -f "$LEGACY_SYSCTL_CONFIG"; fi
+        sysctl --system >>"$LOG_FILE" 2>&1
+        sysctl -p "$runtime_backup" >>"$LOG_FILE" 2>&1
+        mv "$transaction" "$transaction.restored"
+        success "Прежний профиль и runtime-значения восстановлены из транзакции."
+        return 0
+    fi
     backups=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'sysctl.*' 2>/dev/null | sort -r || true)
     if [[ -n "$backups" ]]; then
         selected=$(head -n1 <<<"$backups")

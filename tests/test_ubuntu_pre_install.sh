@@ -102,6 +102,48 @@ for forwarding_mode in yes local remote no; do
 done
 assert_false 'invalid TCP forwarding mode rejected' render_ssh_dropin 'yes; Match all'
 
+[[ "$(vless_buffer_limit_for_ram 512)" == 8388608 ]] || failures=$((failures + 1))
+[[ "$(vless_buffer_limit_for_ram 960)" == 16777216 ]] || failures=$((failures + 1))
+[[ "$(vless_buffer_limit_for_ram 3921)" == 33554432 ]] || failures=$((failures + 1))
+[[ "$(vless_buffer_limit_for_ram 7900)" == 67108864 ]] || failures=$((failures + 1))
+
+(
+    modprobe() { return 0; }
+    sysctl() { printf 'reno cubic bbr\n'; }
+    ensure_running_kernel_bbr
+) || { printf 'FAIL: available kernel BBR was not selected\n' >&2; failures=$((failures + 1)); }
+(
+    modprobe() { return 1; }
+    sysctl() { printf 'reno cubic\n'; }
+    ! ensure_running_kernel_bbr
+) || { printf 'FAIL: missing kernel BBR was accepted\n' >&2; failures=$((failures + 1)); }
+
+profile=$(
+    sysctl() {
+        case "$2" in
+            net.core.somaxconn) printf '4096\n' ;;
+            net.ipv4.tcp_max_syn_backlog) printf '32768\n' ;;
+            net.ipv4.ip_local_port_range) printf '15000 62000\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    render_vless_high_connection_profile 4096
+)
+grep -q '^net.core.default_qdisc=fq$' <<< "$profile" || failures=$((failures + 1))
+grep -q '^net.ipv4.tcp_congestion_control=bbr$' <<< "$profile" || failures=$((failures + 1))
+grep -q '^net.core.somaxconn=16384$' <<< "$profile" || failures=$((failures + 1))
+grep -q '^net.ipv4.tcp_max_syn_backlog=32768$' <<< "$profile" || failures=$((failures + 1))
+grep -q '^net.ipv4.ip_local_port_range=10240 65535$' <<< "$profile" || failures=$((failures + 1))
+grep -q '^net.core.rmem_max=33554432$' <<< "$profile" || failures=$((failures + 1))
+if grep -Eq 'tcp_max_tw_buckets|tcp_tw_reuse|tcp_fin_timeout|busy_poll|tcp_fastopen|tcp_keepalive' <<< "$profile"; then
+    printf 'FAIL: unsafe or unmeasured TCP settings leaked into VLESS profile\n' >&2
+    failures=$((failures + 1))
+fi
+grep -q '/etc/sysctl.d/90-server-scripts-vless-tcp.conf' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: canonical VLESS sysctl profile path is missing\n' >&2
+    failures=$((failures + 1))
+}
+
 backup_line=$(grep -n 'cp -a /etc/ufw.*BACKUP_DIR/ufw' "$ROOT_DIR/ubuntu_pre_install.sh" | head -n1 | cut -d: -f1)
 reset_line=$(grep -n 'ufw --force reset' "$ROOT_DIR/ubuntu_pre_install.sh" | head -n1 | cut -d: -f1)
 if [[ -z "$backup_line" || -z "$reset_line" || "$backup_line" -ge "$reset_line" ]]; then

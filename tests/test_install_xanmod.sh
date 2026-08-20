@@ -40,8 +40,8 @@ fi
 
 assert_eq 8388608 "$(buffer_limit_for_ram 512)" '512 MB buffer ceiling'
 assert_eq 16777216 "$(buffer_limit_for_ram 1024)" '1 GB buffer ceiling'
-assert_eq 16777216 "$(buffer_limit_for_ram 4095)" 'under 4 GB buffer ceiling'
-assert_eq 33554432 "$(buffer_limit_for_ram 4096)" '4 GB buffer ceiling'
+assert_eq 16777216 "$(buffer_limit_for_ram 3583)" 'under nominal 4 GB buffer ceiling'
+assert_eq 33554432 "$(buffer_limit_for_ram 3584)" 'nominal 4 GB buffer ceiling'
 
 packages=$'linux-xanmod-x64v3\nlinux-xanmod-lts-x64v3\nlinux-xanmod-rt-x64v3'
 assert_eq linux-xanmod-lts-x64v3 "$(recommended_package x64v3 "$packages")" 'prefer LTS for VLESS server'
@@ -61,13 +61,17 @@ sysctl() {
 profile=$(render_vless_profile 2048)
 grep -q '^net.core.default_qdisc=fq$' <<<"$profile" || ((failures++))
 grep -q '^net.ipv4.tcp_congestion_control=bbr$' <<<"$profile" || ((failures++))
-grep -q '^net.core.somaxconn=8192$' <<<"$profile" || ((failures++))
+grep -q '^net.core.somaxconn=16384$' <<<"$profile" || ((failures++))
 grep -q '^net.ipv4.tcp_max_syn_backlog=16384$' <<<"$profile" || ((failures++))
+grep -q '^net.ipv4.ip_local_port_range=10240 65535$' <<<"$profile" || ((failures++))
 grep -q '^net.core.rmem_max=16777216$' <<<"$profile" || ((failures++))
 if grep -Eq 'tcp_tw_reuse|tcp_fin_timeout|busy_poll|rmem_default|tcp_fastopen|tcp_keepalive' <<<"$profile"; then
     printf 'FAIL: unsafe or workload-unproven settings leaked into stable profile\n' >&2
     ((failures++))
 fi
+[[ "$(buffer_limit_for_ram 3921)" == 33554432 ]] || ((failures++))
+[[ "$(buffer_limit_for_ram 7900)" == 67108864 ]] || ((failures++))
+[[ "$SYSCTL_CONFIG" == /etc/sysctl.d/90-server-scripts-vless-tcp.conf ]] || ((failures++))
 
 curl() {
     [[ "$*" == *'-f'* ]] && return 99
