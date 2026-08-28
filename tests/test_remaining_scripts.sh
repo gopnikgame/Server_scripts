@@ -69,6 +69,14 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 )
 
 (
+    export SERVER_SCRIPTS_COMMIT=4444444444444444444444444444444444444444
+    # shellcheck source=../server_launcher.sh
+    source "$ROOT_DIR/server_launcher.sh"
+    curl() { fail "launcher used discovery API despite pinned commit"; }
+    [[ $(resolve_latest_commit) == "$SERVER_SCRIPTS_COMMIT" ]] || fail "launcher rejected a valid pinned commit"
+)
+
+(
     # shellcheck source=../speed_dns.sh
     source "$ROOT_DIR/speed_dns.sh"
     _exists bash || fail "speed_dns command detection failed"

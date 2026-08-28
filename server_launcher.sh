@@ -2,10 +2,10 @@
 
 set -Eeuo pipefail
 
-# Version: 2.0.1
+# Version: 2.0.2
 # Description: Transactional launcher and module snapshot manager for Ubuntu 24.04
 
-SCRIPT_VERSION='2.0.1'
+SCRIPT_VERSION='2.0.2'
 SCRIPT_NAME='server_launcher.sh'
 SCRIPT_DIR="${SERVER_SCRIPTS_SCRIPT_DIR:-/root/server-scripts}"
 MODULES_DIR="${SERVER_SCRIPTS_MODULES_DIR:-/usr/local/server-scripts/modules}"
@@ -17,8 +17,10 @@ LOCK_FILE="${SERVER_SCRIPTS_LOCK_FILE:-/run/lock/server-scripts-launcher.lock}"
 REPOSITORY_BRANCH="${SERVER_SCRIPTS_BRANCH:-main}"
 GITHUB_API="${SERVER_SCRIPTS_GITHUB_API:-https://api.github.com/repos/gopnikgame/Server_scripts}"
 GITHUB_RAW="${SERVER_SCRIPTS_GITHUB_RAW:-https://raw.githubusercontent.com/gopnikgame/Server_scripts}"
+GITHUB_ARCHIVE="${SERVER_SCRIPTS_GITHUB_ARCHIVE:-https://codeload.github.com/gopnikgame/Server_scripts/tar.gz}"
+PINNED_COMMIT="${SERVER_SCRIPTS_COMMIT:-}"
 readonly SCRIPT_VERSION SCRIPT_NAME SCRIPT_DIR MODULES_DIR LOG_DIR STATE_DIR BACKUP_ROOT BIN_LINK LOCK_FILE
-readonly REPOSITORY_BRANCH GITHUB_API GITHUB_RAW
+readonly REPOSITORY_BRANCH GITHUB_API GITHUB_RAW GITHUB_ARCHIVE PINNED_COMMIT
 
 MODULE_ORDER=(
     ubuntu_pre_install.sh
@@ -136,6 +138,11 @@ acquire_lock() {
 
 resolve_latest_commit() {
     local response commit
+    if [[ -n "$PINNED_COMMIT" ]]; then
+        [[ "$PINNED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { print_error 'SERVER_SCRIPTS_COMMIT должен содержать полный SHA из 40 символов'; return 1; }
+        printf '%s\n' "$PINNED_COMMIT"
+        return 0
+    fi
     response=$(curl --fail --silent --show-error --location \
         --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 30 \
         --retry 3 --retry-all-errors --retry-delay 2 \
@@ -181,7 +188,7 @@ fetch_snapshot_archive() {
     if ! curl --fail --silent --show-error --location \
         --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 \
         --retry 3 --retry-all-errors --retry-delay 2 \
-        "$GITHUB_API/tarball/$repository_ref" --output "$archive"; then
+        "$GITHUB_ARCHIVE/$repository_ref" --output "$archive"; then
         rm -rf -- "$temp_dir"
         return 1
     fi

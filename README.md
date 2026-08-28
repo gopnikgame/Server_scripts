@@ -1,6 +1,6 @@
 # 🚀 Server Scripts Manager
 
-![Launcher](https://img.shields.io/badge/launcher-v2.0.1-blue)
+![Launcher](https://img.shields.io/badge/launcher-v2.0.2-blue)
 ![Proxy](https://img.shields.io/badge/proxy--manager-v1.3.0--test-blueviolet)
 ![Updated](https://img.shields.io/badge/updated-2026--08--18-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
@@ -11,7 +11,7 @@
 сам launcher и все модули из единого snapshot, проверяет их через `bash -n`,
 создаёт резервную копию и только после этого активирует комплект целиком.
 Если `raw.githubusercontent.com` недоступен, весь комплект загружается одним
-архивом через официальный GitHub tarball API с тем же commit SHA. Перед
+архивом через официальный `codeload.github.com` с тем же commit SHA. Перед
 извлечением проверяются пути, типы файлов и наличие всех ожидаемых скриптов.
 
 ## ⚡ Быстрый старт
@@ -395,6 +395,9 @@ sudo server_launcher.sh
 sudo server_launcher.sh --status       # локальное состояние без сетевой проверки
 sudo server_launcher.sh --refresh      # обновить snapshot и завершить работу
 sudo server_launcher.sh --no-refresh   # открыть меню без автоматического обновления
+
+# Аварийно установить конкретный опубликованный snapshot без discovery API:
+sudo SERVER_SCRIPTS_COMMIT=<полный-SHA-40-символов> server_launcher.sh --refresh
 ```
 
 ---
