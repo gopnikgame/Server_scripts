@@ -8,6 +8,13 @@ trap 'rm -rf -- "$TMP_ROOT"' EXIT
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 (
+    export SERVER_SCRIPTS_SCRIPT_DIR="$TMP_ROOT/launcher/script"
+    export SERVER_SCRIPTS_MODULES_DIR="$TMP_ROOT/launcher/modules"
+    export SERVER_SCRIPTS_LOG_DIR="$TMP_ROOT/launcher/log"
+    export SERVER_SCRIPTS_STATE_DIR="$TMP_ROOT/launcher/state"
+    export SERVER_SCRIPTS_BACKUP_ROOT="$TMP_ROOT/launcher/backups"
+    export SERVER_SCRIPTS_BIN_LINK="$TMP_ROOT/launcher/bin/server_launcher.sh"
+    export SERVER_SCRIPTS_LOCK_FILE="$TMP_ROOT/launcher/run/launcher.lock"
     # shellcheck source=../server_launcher.sh
     source "$ROOT_DIR/server_launcher.sh"
     [[ "$REPOSITORY_BRANCH" == main ]] || fail "launcher does not track main by default"
@@ -15,9 +22,10 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
         fail "launcher accepted an unsafe module name"
     fi
     curl() {
-        local previous='' output='' argument
+        local previous='' output='' argument source_url=''
         for argument in "$@"; do
-            if [[ "$previous" == '--output' ]]; then output="$argument"; break; fi
+            [[ "$argument" == http* ]] && source_url="$argument"
+            if [[ "$previous" == '--output' ]]; then output="$argument"; fi
             previous="$argument"
         done
         if [[ -z "$output" ]]; then
@@ -25,11 +33,39 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
             return 0
         fi
         [[ -n "$output" ]] || return 2
-        printf '#!/usr/bin/env bash\nprintf "fixture\\n"\n' > "$output"
+        if [[ -n "${FAIL_DOWNLOAD_NAME:-}" && "$source_url" == *"/$FAIL_DOWNLOAD_NAME"* ]]; then return 22; fi
+        printf '#!/usr/bin/env bash\n# Version: 2.0.0\nprintf "fixture\\n"\n' > "$output"
     }
     [[ $(resolve_latest_commit) == '1111111111111111111111111111111111111111' ]] || fail "launcher latest-main resolution failed"
     download_script 'fixture.sh' "$TMP_ROOT/fixture.sh" '1111111111111111111111111111111111111111'
     bash -n "$TMP_ROOT/fixture.sh" || fail "launcher did not install a valid fixture atomically"
+
+    create_directories
+    stage_one="$TMP_ROOT/stage-one"
+    stage_snapshot '1111111111111111111111111111111111111111' "$stage_one"
+    validate_snapshot "$stage_one" || fail "launcher rejected a complete staged snapshot"
+    backup_one=$(backup_current_snapshot '1111111111111111111111111111111111111111')
+    activate_snapshot "$stage_one" '1111111111111111111111111111111111111111' "$backup_one"
+    snapshot_is_current "$stage_one" || fail "launcher did not activate the complete snapshot"
+    [[ $(grep -c '^SNAPSHOT_COMMIT=1111111111111111111111111111111111111111$' "$STATE_DIR/snapshot.env") -eq 1 ]] || fail "launcher state was not recorded"
+
+    launcher_hash=$(sha256sum "$SCRIPT_DIR/$SCRIPT_NAME" | awk '{print $1}')
+    module_hash=$(sha256sum "$MODULES_DIR/${MODULE_ORDER[0]}" | awk '{print $1}')
+    stage_bad="$TMP_ROOT/stage-bad"
+    cp -a "$stage_one" "$stage_bad"
+    printf 'if (\n' > "$stage_bad/modules/${MODULE_ORDER[0]}"
+    backup_bad=$(backup_current_snapshot '2222222222222222222222222222222222222222')
+    if activate_snapshot "$stage_bad" '2222222222222222222222222222222222222222' "$backup_bad"; then
+        fail "launcher activated a broken snapshot"
+    fi
+    [[ $(sha256sum "$SCRIPT_DIR/$SCRIPT_NAME" | awk '{print $1}') == "$launcher_hash" ]] || fail "launcher rollback did not restore launcher"
+    [[ $(sha256sum "$MODULES_DIR/${MODULE_ORDER[0]}" | awk '{print $1}') == "$module_hash" ]] || fail "launcher rollback did not restore modules"
+
+    FAIL_DOWNLOAD_NAME=${MODULE_ORDER[1]}
+    if stage_snapshot '3333333333333333333333333333333333333333' "$TMP_ROOT/stage-failed"; then
+        fail "launcher accepted an incomplete download"
+    fi
+    [[ $(sha256sum "$MODULES_DIR/${MODULE_ORDER[0]}" | awk '{print $1}') == "$module_hash" ]] || fail "failed download changed active modules"
 )
 
 (

@@ -1,13 +1,17 @@
 # 🚀 Server Scripts Manager
 
-![Launcher](https://img.shields.io/badge/launcher-v1.1.0-blue)
+![Launcher](https://img.shields.io/badge/launcher-v2.0.0-blue)
 ![Proxy](https://img.shields.io/badge/proxy--manager-v1.3.0--test-blueviolet)
 ![Updated](https://img.shields.io/badge/updated-2026--08--18-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04-orange)
 
 Модульный комплекс bash-скриптов для первоначальной настройки и оптимизации Ubuntu 24.04 серверов.  
-При каждом запуске launcher определяет свежий commit ветки `main`, загружает все модули из этого единого snapshot, проверяет их через `bash -n` и запускает через интерактивное меню.
+При каждом запуске launcher определяет свежий commit ветки `main`, загружает
+сам launcher и все модули из единого snapshot, проверяет их через `bash -n`,
+создаёт резервную копию и только после этого активирует комплект целиком.
+Если `raw.githubusercontent.com` недоступен, используется официальный GitHub
+Contents API с тем же commit SHA.
 
 ## ⚡ Быстрый старт
 
@@ -313,6 +317,8 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
 ```
 /root/server-scripts/                         # Launcher
 /usr/local/server-scripts/modules/            # Загруженные модули
+/var/lib/server-scripts/snapshot.env           # SHA и версия активного snapshot
+/var/backups/server-scripts/launcher/          # Резервные копии обновлений launcher
 /usr/local/etc/xray/config.json               # Конфигурация Xray
 /etc/server-scripts/proxy.conf                # Состояние прокси
 /etc/profile.d/proxy.sh                       # Экспорт переменных прокси
@@ -382,8 +388,12 @@ journalctl -u server-scripts-update.service -f
 
 ```bash
 sudo server_launcher.sh
-# → «Обновить все модули»  — перезагрузить модули с GitHub
-# → «Обновить launcher»    — обновить сам менеджер
+# → при старте проверяется весь snapshot launcher + модули
+# → «Проверить и обновить весь snapshot» — повторить проверку вручную
+
+sudo server_launcher.sh --status       # локальное состояние без сетевой проверки
+sudo server_launcher.sh --refresh      # обновить snapshot и завершить работу
+sudo server_launcher.sh --no-refresh   # открыть меню без автоматического обновления
 ```
 
 ---
