@@ -2,10 +2,10 @@
 
 set -Eeuo pipefail
 
-# Version: 2.0.0
+# Version: 2.0.1
 # Description: Transactional launcher and module snapshot manager for Ubuntu 24.04
 
-SCRIPT_VERSION='2.0.0'
+SCRIPT_VERSION='2.0.1'
 SCRIPT_NAME='server_launcher.sh'
 SCRIPT_DIR="${SERVER_SCRIPTS_SCRIPT_DIR:-/root/server-scripts}"
 MODULES_DIR="${SERVER_SCRIPTS_MODULES_DIR:-/usr/local/server-scripts/modules}"
@@ -95,7 +95,7 @@ check_dependencies() {
     local -A command_packages=(
         [awk]=mawk [bash]=bash [cmp]=diffutils [cp]=coreutils [curl]=curl [env]=coreutils
         [flock]=util-linux [grep]=grep [install]=coreutils [mktemp]=coreutils
-        [modinfo]=kmod [realpath]=coreutils [sed]=sed [sysctl]=procps
+        [gzip]=gzip [modinfo]=kmod [realpath]=coreutils [sed]=sed [sysctl]=procps [tar]=tar
     )
     local command_name package
     local -a missing_commands=() missing_packages=()
@@ -150,7 +150,7 @@ fetch_script() {
     local name="$1" destination="$2" repository_ref="$3"
     [[ "$repository_ref" =~ ^[0-9a-f]{40}$ ]] || { print_error 'Некорректный commit snapshot'; return 2; }
     [[ "$name" =~ ^[a-z0-9_]+\.sh$ ]] || { print_error "Недопустимое имя модуля: $name"; return 2; }
-    if [[ "$DOWNLOAD_CHANNEL" != api ]] && curl --fail --silent --show-error --location \
+    if curl --fail --silent --show-error --location \
         --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 90 \
         "$GITHUB_RAW/$repository_ref/$name" --output "$destination"; then
         DOWNLOAD_CHANNEL=raw
@@ -170,6 +170,57 @@ fetch_script() {
     [[ -s "$destination" ]] || { print_error "Получен пустой файл: $name"; return 1; }
     bash -n "$destination" || { print_error "$name не прошёл bash -n"; return 1; }
     chmod 0755 -- "$destination"
+}
+
+fetch_snapshot_archive() {
+    local repository_ref="$1" stage_root="$2" temp_dir archive members top_level module entry
+    local -a archive_paths=()
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/server-scripts-archive.XXXXXX") || return 1
+    archive="$temp_dir/snapshot.tar.gz"
+    members="$temp_dir/members.txt"
+    if ! curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 \
+        --retry 3 --retry-all-errors --retry-delay 2 \
+        "$GITHUB_API/tarball/$repository_ref" --output "$archive"; then
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    if ! tar -tzf "$archive" > "$members"; then rm -rf -- "$temp_dir"; return 1; fi
+    if grep -Eq '(^/|(^|/)\.\.(/|$)|\\)' "$members"; then
+        print_error 'GitHub snapshot содержит небезопасный путь'
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    if ! tar -tvzf "$archive" | awk '$1 !~ /^[-d]/ { bad=1 } END { exit bad }'; then
+        print_error 'GitHub snapshot содержит ссылки или специальные файлы'
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    top_level=$(awk -F/ 'NF {print $1}' "$members" | sort -u)
+    [[ -n "$top_level" && "$top_level" != *$'\n'* ]] || {
+        print_error 'GitHub snapshot имеет неожиданный верхний уровень'
+        rm -rf -- "$temp_dir"
+        return 1
+    }
+    archive_paths+=("$top_level/$SCRIPT_NAME")
+    for module in "${MODULE_ORDER[@]}"; do archive_paths+=("$top_level/$module"); done
+    for entry in "${archive_paths[@]}"; do
+        grep -Fxq -- "$entry" "$members" || { print_error "В snapshot отсутствует $entry"; rm -rf -- "$temp_dir"; return 1; }
+    done
+    install -d -m 0700 -- "$temp_dir/extract"
+    if ! tar --extract --gzip --file="$archive" --directory="$temp_dir/extract" \
+        --no-same-owner --no-same-permissions -- "${archive_paths[@]}"; then
+        rm -rf -- "$temp_dir"
+        return 1
+    fi
+    install -d -m 0700 -- "$stage_root/modules"
+    install -m 0755 -- "$temp_dir/extract/$top_level/$SCRIPT_NAME" "$stage_root/$SCRIPT_NAME"
+    bash -n "$stage_root/$SCRIPT_NAME" || { rm -rf -- "$temp_dir"; return 1; }
+    for module in "${MODULE_ORDER[@]}"; do
+        install -m 0755 -- "$temp_dir/extract/$top_level/$module" "$stage_root/modules/$module"
+        bash -n "$stage_root/modules/$module" || { rm -rf -- "$temp_dir"; return 1; }
+    done
+    rm -rf -- "$temp_dir"
 }
 
 # Совместимый атомарный загрузчик одного файла; полный update использует stage_snapshot.
@@ -195,11 +246,31 @@ stage_snapshot() {
     local repository_ref="$1" stage_root="$2" module
     install -d -m 0700 -- "$stage_root/modules"
     print_step "Загрузка launcher из ${repository_ref:0:12}"
-    fetch_script "$SCRIPT_NAME" "$stage_root/$SCRIPT_NAME" "$repository_ref" || return 1
-    for module in "${MODULE_ORDER[@]}"; do
-        print_step "Загрузка $module"
-        fetch_script "$module" "$stage_root/modules/$module" "$repository_ref" || return 1
-    done
+    if curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 90 \
+        "$GITHUB_RAW/$repository_ref/$SCRIPT_NAME" --output "$stage_root/$SCRIPT_NAME"; then
+        [[ -s "$stage_root/$SCRIPT_NAME" ]] && bash -n "$stage_root/$SCRIPT_NAME" || return 1
+        chmod 0755 -- "$stage_root/$SCRIPT_NAME"
+        for module in "${MODULE_ORDER[@]}"; do
+            print_step "Загрузка $module"
+            if ! curl --fail --silent --show-error --location \
+                --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 90 \
+                "$GITHUB_RAW/$repository_ref/$module" --output "$stage_root/modules/$module" \
+                || [[ ! -s "$stage_root/modules/$module" ]] || ! bash -n "$stage_root/modules/$module"; then
+                print_step 'Raw snapshot загрузился не полностью; переключаюсь на GitHub tarball API'
+                rm -rf -- "$stage_root"
+                install -d -m 0700 -- "$stage_root"
+                fetch_snapshot_archive "$repository_ref" "$stage_root"
+                return $?
+            fi
+            chmod 0755 -- "$stage_root/modules/$module"
+        done
+    else
+        print_step 'Raw-канал недоступен; загружаю pinned snapshot через GitHub tarball API'
+        rm -rf -- "$stage_root"
+        install -d -m 0700 -- "$stage_root"
+        fetch_snapshot_archive "$repository_ref" "$stage_root"
+    fi
 }
 
 validate_snapshot() {

@@ -1,6 +1,6 @@
 # 🚀 Server Scripts Manager
 
-![Launcher](https://img.shields.io/badge/launcher-v2.0.0-blue)
+![Launcher](https://img.shields.io/badge/launcher-v2.0.1-blue)
 ![Proxy](https://img.shields.io/badge/proxy--manager-v1.3.0--test-blueviolet)
 ![Updated](https://img.shields.io/badge/updated-2026--08--18-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
@@ -10,8 +10,9 @@
 При каждом запуске launcher определяет свежий commit ветки `main`, загружает
 сам launcher и все модули из единого snapshot, проверяет их через `bash -n`,
 создаёт резервную копию и только после этого активирует комплект целиком.
-Если `raw.githubusercontent.com` недоступен, используется официальный GitHub
-Contents API с тем же commit SHA.
+Если `raw.githubusercontent.com` недоступен, весь комплект загружается одним
+архивом через официальный GitHub tarball API с тем же commit SHA. Перед
+извлечением проверяются пути, типы файлов и наличие всех ожидаемых скриптов.
 
 ## ⚡ Быстрый старт
 
