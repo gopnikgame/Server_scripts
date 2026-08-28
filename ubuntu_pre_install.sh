@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 # Метаданные скрипта
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 
 # Цветовые коды
 RED='\033[0;31m'
@@ -56,6 +56,10 @@ VLESS_SYSCTL_CONFIG="${VLESS_SYSCTL_CONFIG:-/etc/sysctl.d/90-server-scripts-vles
 VLESS_LEGACY_CONFIG="${VLESS_LEGACY_CONFIG:-/etc/sysctl.d/99-xanmod-vless-tcp.conf}"
 VLESS_MODULE_CONFIG="${VLESS_MODULE_CONFIG:-/etc/modules-load.d/90-server-scripts-bbr.conf}"
 VLESS_BACKUP_DIR="${VLESS_BACKUP_DIR:-/var/backups/server-scripts/vless-tcp}"
+IPV6_SYSCTL_CONFIG="${IPV6_SYSCTL_CONFIG:-/etc/sysctl.d/90-server-scripts-ipv6.conf}"
+IPV6_LEGACY_FILE="${IPV6_LEGACY_FILE:-/etc/sysctl.conf}"
+IPV6_BACKUP_DIR="${IPV6_BACKUP_DIR:-/var/backups/server-scripts/ipv6}"
+IPV6_SERVICE_FILE="${IPV6_SERVICE_FILE:-/etc/systemd/system/server-scripts-ipv6.service}"
 
 # Функция логирования с цветным выводом
 log() {
@@ -108,7 +112,7 @@ rollback() {
             else
                 rm -f /root/.ssh/authorized_keys
             fi
-            sshd -t >/dev/null 2>&1 && systemctl reload ssh >/dev/null 2>&1 || true
+            if sshd -t >/dev/null 2>&1; then systemctl reload ssh >/dev/null 2>&1 || true; fi
             ;;
     esac
     ROLLBACK_ACTIVE=0
@@ -195,7 +199,7 @@ current_ssh_client_ip() {
     local connection="${SSH_CONNECTION:-}" client
     [[ -n "$connection" ]] || return 0
     client="${connection%% *}"
-    valid_ip_or_cidr "$client" && printf '%s\n' "$client" || true
+    if valid_ip_or_cidr "$client"; then printf '%s\n' "$client"; fi
 }
 
 render_ssh_dropin() {
@@ -245,6 +249,8 @@ pin_dnscrypt_installer_snapshot() {
     ! grep -q 'https://raw.githubusercontent.com/gopnikgame/Installer_dnscypt/main/' "$installer"
 }
 
+# The quoted strings below are literal shell source written into another script.
+# shellcheck disable=SC2016
 normalize_dnscrypt_manager_entrypoint() {
     local main_script="$1" candidate line replaced=0
     local expected='SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
@@ -588,81 +594,34 @@ configure_firewall() {
 
 
 
-# Смена пароля root
-change_root_password() {
-    log "INFO" "Смена пароля пользователя root..."
-    
-    # Проверка, что команда passwd доступна
-    if ! command -v passwd &> /dev/null; then
-        log "ERROR" "Команда passwd не найдена. Невозможно сменить пароль."
-        return 1
-    fi
-    
-    echo -e "${YELLOW}=== Смена пароля пользователя root ===${NC}"
-    echo "ВНИМАНИЕ: Пароль не будет отображаться при вводе."
-    echo "Если вы планируете использовать только SSH-ключи, пароль можно сделать сложным."
+# Смена пароля через системный passwd: пароль не хранится в shell-переменных,
+# временных файлах, аргументах процесса или журнале этого скрипта.
+change_account_password() {
+    local account="${1:-root}"
+    [[ "$account" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || {
+        print_error "Недопустимое имя пользователя."; return 2;
+    }
+    command -v passwd >/dev/null 2>&1 || {
+        log "ERROR" "Команда passwd не найдена. Пароль не изменён."; return 1;
+    }
+    getent passwd "$account" >/dev/null 2>&1 || {
+        print_error "Пользователь $account не существует."; return 1;
+    }
 
-    # Запрашиваем новый пароль
-    local password_changed=0
-    local attempt=1
-    local max_attempts=3
-
-    while [ $password_changed -eq 0 ] && [ $attempt -le $max_attempts ]; do
-        echo ""
-        echo "Попытка $attempt из $max_attempts:"
-        
-        # Используем временный файл для смены пароля
-        temp_file=$(mktemp)
-        chmod 600 "$temp_file"
-        
-        read -s -p "Введите новый пароль: " password
-        echo ""
-        read -s -p "Повторите новый пароль: " password_confirm
-        echo ""
-        
-        if [ "$password" != "$password_confirm" ]; then
-            log "WARNING" "Пароли не совпадают. Попробуйте снова."
-            attempt=$((attempt+1))
-            continue
-        fi
-        
-        if [ -z "$password" ]; then
-            log "WARNING" "Пароль не может быть пустым. Попробуйте снова."
-            attempt=$((attempt+1))
-            continue
-        fi
-        
-        # Проверка сложности пароля
-        if [ ${#password} -lt 8 ]; then
-            echo -e "${YELLOW}Предупреждение: Пароль короче 8 символов.${NC}"
-            read -p "Продолжить со слабым паролем? (y/n): " confirm
-            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                attempt=$((attempt+1))
-                continue
-            fi
-        fi
-        
-        # Меняем пароль
-        echo "root:$password" | chpasswd 2> "$temp_file"
-        
-        if [ $? -eq 0 ]; then
-            log "INFO" "Пароль пользователя root успешно изменен."
-            password_changed=1
-        else
-            log "ERROR" "Ошибка при смене пароля: $(cat "$temp_file")"
-            attempt=$((attempt+1))
-        fi
-        
-        rm -f "$temp_file"
-    done
-    
-    if [ $password_changed -eq 0 ]; then
-        log "ERROR" "Не удалось сменить пароль после $max_attempts попыток."
-        return 1
+    print_header "СМЕНА ПАРОЛЯ: $account"
+    echo "Ввод обрабатывает системная команда passwd; символы не отображаются."
+    echo "Требования сложности и повторный ввод контролируются PAM текущей системы."
+    if passwd "$account"; then
+        log "INFO" "Пароль пользователя $account успешно изменён через passwd."
+        print_success "Пароль пользователя $account изменён."
+        return 0
     fi
-    
-    return 0
+    log "ERROR" "passwd не смог изменить пароль пользователя $account."
+    print_error "Пароль не изменён."
+    return 1
 }
+
+change_root_password() { change_account_password root; }
 
 
 # Настройка SSH
@@ -704,7 +663,7 @@ configure_ssh() {
         log "INFO" "Публичный ключ обычно находится в файле ~/.ssh/id_rsa.pub или ~/.ssh/id_ed25519.pub."
         log "INFO" "Пример публичного ключа:"
         log "INFO" "ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEArV1... user@hostname"
-        read -p "Введите ваш публичный ключ SSH: " public_key
+        read -r -p "Введите ваш публичный ключ SSH: " public_key
 
         local key_file
         key_file="$(mktemp)"
@@ -977,140 +936,207 @@ apply_system_tweaks() {
     done
 }
 
-# Проверка статуса IPv6
+# Управление IPv6 через отдельный sysctl.d-профиль.
 check_ipv6_status() {
-    if [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" -eq 0 ]; then
-        return 0  # IPv6 включен
+    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == 0 ]]
+}
+
+render_ipv6_profile() {
+    local disabled="$1"
+    [[ "$disabled" == 0 || "$disabled" == 1 ]] || return 2
+    cat <<EOF
+# Server_scripts: managed IPv6 state
+# 0 = enabled, 1 = disabled
+net.ipv6.conf.all.disable_ipv6=$disabled
+net.ipv6.conf.default.disable_ipv6=$disabled
+EOF
+}
+
+render_ipv6_service() {
+    cat <<EOF
+[Unit]
+Description=Reapply Server_scripts IPv6 state after network configuration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/sysctl -p $IPV6_SYSCTL_CONFIG
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+render_ipv6_legacy_cleanup() {
+    local source="$1"
+    awk '
+        /^[[:space:]]*#[[:space:]]*(Включение|Отключение)[[:space:]]+IPv6[[:space:]]*$/ {next}
+        /^[[:space:]]*net\.ipv6\.conf\.[^.[:space:]]+\.disable_ipv6[[:space:]]*=/ {next}
+        {print}
+    ' "$source"
+}
+
+snapshot_ipv6_runtime() {
+    local target="$1" path key
+    : > "$target"
+    for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [[ -f "$path" ]] || continue
+        key=${path#/proc/sys/}
+        key=${key//\//.}
+        printf '%s=%s\n' "$key" "$(<"$path")" >> "$target"
+    done
+    chmod 0600 "$target"
+}
+
+verify_ipv6_runtime() {
+    local expected="$1" path
+    [[ "$expected" == 0 || "$expected" == 1 ]] || return 2
+    for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [[ -f "$path" ]] || continue
+        [[ "$(<"$path")" == "$expected" ]] || return 1
+    done
+}
+
+show_ipv6_status() {
+    local path name
+    print_header "СОСТОЯНИЕ IPv6"
+    for path in /proc/sys/net/ipv6/conf/*/disable_ipv6; do
+        [[ -f "$path" ]] || continue
+        name=${path%/disable_ipv6}; name=${name##*/}
+        printf '%-16s disable_ipv6=%s\n' "$name" "$(<"$path")"
+    done
+    printf 'Профиль: %s\n' "$([[ -f "$IPV6_SYSCTL_CONFIG" ]] && echo "$IPV6_SYSCTL_CONFIG" || echo не-установлен)"
+    printf 'Повтор после сети: %s/%s\n' \
+        "$(systemctl is-enabled server-scripts-ipv6.service 2>/dev/null || echo не-установлен)" \
+        "$(systemctl is-active server-scripts-ipv6.service 2>/dev/null || echo не-активен)"
+    printf '\nIPv6-адреса:\n'
+    ip -6 -brief address show 2>/dev/null || true
+    printf '\nIPv6-маршруты:\n'
+    ip -6 route show 2>/dev/null || true
+}
+
+restore_ipv6_backup() {
+    local backup="$1" had_profile=0 had_service=0 service_was_enabled=0
+    [[ -f "$backup/state" && -f "$backup/runtime.conf" && -f "$backup/sysctl.conf" ]] || {
+        print_error "Некорректная резервная копия IPv6: $backup"; return 1;
+    }
+    read -r had_profile had_service service_was_enabled < "$backup/state" || true
+    cp -a "$backup/sysctl.conf" "$IPV6_LEGACY_FILE"
+    if (( had_profile == 1 )); then cp -a "$backup/profile.conf" "$IPV6_SYSCTL_CONFIG"; else rm -f "$IPV6_SYSCTL_CONFIG"; fi
+    if (( had_service == 1 )); then cp -a "$backup/service" "$IPV6_SERVICE_FILE"; else rm -f "$IPV6_SERVICE_FILE"; fi
+    systemctl daemon-reload
+    if [[ "$service_was_enabled" == 1 ]]; then
+        systemctl enable server-scripts-ipv6.service >/dev/null
     else
-        return 1  # IPv6 выключен
+        systemctl disable server-scripts-ipv6.service >/dev/null 2>&1 || true
     fi
+    sysctl -p "$backup/runtime.conf" >> "$LOG_FILE" 2>&1
 }
 
-# Включение IPv6
-enable_ipv6() {
-    log "INFO" "Включение IPv6..."
-    
-    if check_ipv6_status; then
-        log "INFO" "IPv6 уже включен."
-        print_success "IPv6 уже включен."
-        return 0
+apply_ipv6_state() {
+    local disabled="$1" action temporary service_temporary legacy_temporary stamp backup
+    local had_profile=0 had_service=0 service_was_enabled=0 mutation_failed=0
+    [[ "$disabled" == 0 || "$disabled" == 1 ]] || { print_error "Недопустимое состояние IPv6."; return 2; }
+    action=$([[ "$disabled" == 0 ]] && echo включить || echo отключить)
+    temporary=$(mktemp)
+    service_temporary=$(mktemp --suffix=.service)
+    legacy_temporary=$(mktemp)
+    render_ipv6_profile "$disabled" > "$temporary"
+    render_ipv6_service > "$service_temporary"
+    render_ipv6_legacy_cleanup "$IPV6_LEGACY_FILE" > "$legacy_temporary"
+    if ! systemd-analyze verify "$service_temporary" >> "$LOG_FILE" 2>&1; then
+        rm -f "$temporary" "$service_temporary" "$legacy_temporary"
+        print_error "systemd отклонил unit повторного применения IPv6."
+        return 1
     fi
 
-    print_step "Включение IPv6..."
-    interface_name=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n 1)
-
-    # Создаем резервную копию sysctl.conf
-    backup_file "/etc/sysctl.conf"
-
-    # Удаляем старые настройки IPv6
-    sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
-    sed -i "/net.ipv6.conf.$interface_name.disable_ipv6/d" /etc/sysctl.conf
-
-    # Добавляем новые настройки для включения IPv6
-    echo "# Включение IPv6" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.all.disable_ipv6 = 0" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.default.disable_ipv6 = 0" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.lo.disable_ipv6 = 0" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.$interface_name.disable_ipv6 = 0" >> /etc/sysctl.conf
-
-    # Применяем изменения
-    sysctl -p > /dev/null 2>&1
-
-    log "INFO" "IPv6 успешно включен."
-    print_success "IPv6 успешно включен."
-    
-    # Информация о сетевых интерфейсах с IPv6
-    print_step "Проверка конфигурации IPv6..."
-    ip -6 addr show | grep -v "scope host" || echo "IPv6 адреса пока не назначены."
-    
-    log "INFO" "Рекомендуется перезагрузить систему для полного применения изменений."
-    print_step "Рекомендуется перезагрузить систему для полного применения изменений."
-    
-    return 0
-}
-
-# Отключение IPv6
-disable_ipv6() {
-    log "INFO" "Отключение IPv6..."
-    
-    if ! check_ipv6_status; then
-        log "INFO" "IPv6 уже отключен."
-        print_success "IPv6 уже отключен."
-        return 0
+    print_header "ПЛАН IPv6"
+    printf 'Действие: %s IPv6 постоянно\n' "$action"
+    if ! cmp -s "$IPV6_LEGACY_FILE" "$legacy_temporary"; then
+        print_warning "Старые disable_ipv6-строки будут удалены из $IPV6_LEGACY_FILE после резервного копирования:"
+        grep -nE '^[[:space:]]*net\.ipv6\.conf\.[^.[:space:]]+\.disable_ipv6[[:space:]]*=' "$IPV6_LEGACY_FILE" || true
     fi
+    cat "$temporary"
+    print_step "После настройки сети systemd повторно применит профиль ко всем созданным интерфейсам."
+    confirm "Применить этот план?" || { rm -f "$temporary" "$service_temporary" "$legacy_temporary"; return 0; }
 
-    print_step "Отключение IPv6..."
-    interface_name=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -n 1)
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="$IPV6_BACKUP_DIR/$stamp"
+    mkdir -p "$backup"
+    chmod 0700 "$IPV6_BACKUP_DIR" "$backup"
+    cp -a "$IPV6_LEGACY_FILE" "$backup/sysctl.conf"
+    snapshot_ipv6_runtime "$backup/runtime.conf"
+    if [[ -e "$IPV6_SYSCTL_CONFIG" ]]; then cp -a "$IPV6_SYSCTL_CONFIG" "$backup/profile.conf"; had_profile=1; fi
+    if [[ -e "$IPV6_SERVICE_FILE" ]]; then cp -a "$IPV6_SERVICE_FILE" "$backup/service"; had_service=1; fi
+    if systemctl is-enabled --quiet server-scripts-ipv6.service 2>/dev/null; then service_was_enabled=1; fi
+    printf '%s %s %s\n' "$had_profile" "$had_service" "$service_was_enabled" > "$backup/state"
 
-    # Создаем резервную копию sysctl.conf
-    backup_file "/etc/sysctl.conf"
-
-    # Удаляем старые настройки IPv6
-    sed -i '/net.ipv6.conf.all.disable_ipv6/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.conf.default.disable_ipv6/d' /etc/sysctl.conf
-    sed -i '/net.ipv6.conf.lo.disable_ipv6/d' /etc/sysctl.conf
-    sed -i "/net.ipv6.conf.$interface_name.disable_ipv6/d" /etc/sysctl.conf
-
-    # Добавляем новые настройки для отключения IPv6
-    echo "# Отключение IPv6" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.default.disable_ipv6 = 1" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.lo.disable_ipv6 = 1" >> /etc/sysctl.conf
-    echo "net.ipv6.conf.$interface_name.disable_ipv6 = 1" >> /etc/sysctl.conf
-
-    # Применяем изменения
-    sysctl -p > /dev/null 2>&1
-
-    log "INFO" "IPv6 успешно отключен."
-    print_success "IPv6 успешно отключен."
-    
-    log "INFO" "Рекомендуется перезагрузить систему для полного применения изменений."
-    print_step "Рекомендуется перезагрузить систему для полного применения изменений."
-    
-    return 0
+    if ! cmp -s "$IPV6_LEGACY_FILE" "$legacy_temporary"; then
+        install -o "$(stat -c %u "$IPV6_LEGACY_FILE")" -g "$(stat -c %g "$IPV6_LEGACY_FILE")" \
+            -m "$(stat -c %a "$IPV6_LEGACY_FILE")" "$legacy_temporary" "$IPV6_LEGACY_FILE" || mutation_failed=1
+    fi
+    (( mutation_failed == 1 )) || install -m 0644 "$temporary" "$IPV6_SYSCTL_CONFIG" || mutation_failed=1
+    (( mutation_failed == 1 )) || install -m 0644 "$service_temporary" "$IPV6_SERVICE_FILE" || mutation_failed=1
+    rm -f "$temporary" "$service_temporary" "$legacy_temporary"
+    (( mutation_failed == 1 )) || systemctl daemon-reload || mutation_failed=1
+    (( mutation_failed == 1 )) || systemctl enable server-scripts-ipv6.service >/dev/null || mutation_failed=1
+    if (( mutation_failed == 1 )); then
+        print_error "Не удалось установить IPv6-профиль или unit; выполняется откат."
+        restore_ipv6_backup "$backup"
+        return 1
+    fi
+    if ! sysctl -p "$IPV6_SYSCTL_CONFIG" >> "$LOG_FILE" 2>&1; then
+        print_error "Применение IPv6-профиля завершилось ошибкой; выполняется откат."
+        restore_ipv6_backup "$backup"
+        return 1
+    fi
+    if ! verify_ipv6_runtime "$disabled"; then
+        print_error "Не все текущие интерфейсы получили disable_ipv6=$disabled; выполняется откат."
+        restore_ipv6_backup "$backup"
+        return 1
+    fi
+    log "INFO" "IPv6 disable_ipv6=$disabled применён. Резервная копия: $backup"
+    print_success "IPv6-профиль применён. Резервная копия: $backup"
+    show_ipv6_status
 }
 
-# Управление IPv6
+rollback_ipv6_state() {
+    local backup
+    backup=$(find "$IPV6_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name '20??????-??????' 2>/dev/null | sort -r | head -n 1 || true)
+    [[ -n "$backup" ]] || { print_warning "Резервные копии IPv6 не найдены."; return 0; }
+    printf 'Будет восстановлена копия: %s\n' "$backup"
+    confirm "Выполнить откат IPv6?" || return 0
+    restore_ipv6_backup "$backup"
+    mv "$backup" "$backup.restored"
+    print_success "Конфигурация и runtime-состояние IPv6 восстановлены."
+    show_ipv6_status
+}
+
+enable_ipv6() { apply_ipv6_state 0; }
+disable_ipv6() { apply_ipv6_state 1; }
+
 manage_ipv6() {
+    local choice
     while true; do
-        print_header "Управление IPv6"
-        
-        # Проверяем текущий статус IPv6
-        if check_ipv6_status; then
-            echo -e "Текущий статус: ${GREEN}IPv6 включен${NC}"
-            echo
-            echo -e "1) ${YELLOW}Отключить IPv6${NC}"
-        else
-            echo -e "Текущий статус: ${RED}IPv6 отключен${NC}"
-            echo
-            echo -e "1) ${GREEN}Включить IPv6${NC}"
-        fi
-        
-        echo -e "0) ${BLUE}Вернуться в предыдущее меню${NC}"
-        echo
-        
-        read -p "Выберите действие [0-1]: " choice
-        
-        case $choice in
-            0)
-                return 0
-                ;;
-            1)
-                if check_ipv6_status; then
-                    disable_ipv6
-                else
-                    enable_ipv6
-                fi
-                ;;
-            *)
-                print_error "Неверный выбор"
-                ;;
+        print_header "УПРАВЛЕНИЕ IPv6"
+        echo "1) Включить IPv6"
+        echo "2) Отключить IPv6"
+        echo "3) Показать состояние"
+        echo "4) Откатить последнее изменение"
+        echo "0) Вернуться"
+        read -r -p "Выберите действие [0-4]: " choice || return 0
+        case "$choice" in
+            1) enable_ipv6 ;;
+            2) disable_ipv6 ;;
+            3) show_ipv6_status ;;
+            4) rollback_ipv6_state ;;
+            0|'') return 0 ;;
+            *) print_error "Введите 0, 1, 2, 3 или 4." ;;
         esac
-        
         echo
-        read -p "Нажмите Enter для продолжения..."
+        read -r -p "Нажмите Enter для продолжения..." || return 0
     done
 }
 
@@ -1123,7 +1149,7 @@ reboot_system() {
     if tty -s; then
         echo -e "${YELLOW}=== Перезагрузка системы ===${NC}"
         echo "Все несохраненные данные будут потеряны."
-        read -p "Вы уверены, что хотите перезагрузить систему сейчас? (y/n): " confirm
+        read -r -p "Вы уверены, что хотите перезагрузить систему сейчас? (y/n): " confirm
         
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             log "INFO" "Выполняется перезагрузка..."
@@ -1160,7 +1186,7 @@ show_menu() {
         ((i++))
         echo -e "$i) ${GREEN}Настроить SSH${NC}"
         ((i++))
-        echo -e "$i) ${GREEN}Применить системные твики${NC}"
+        echo -e "$i) ${GREEN}Профиль VLESS/REALITY High Connection${NC}"
         ((i++))
         echo -e "$i) ${YELLOW}Управление IPv6${NC}"
         ((i++))
@@ -1169,7 +1195,7 @@ show_menu() {
         echo -e "0) ${RED}Выход${NC}"
         echo
         
-        read -p "Выберите опцию [0-$((i-1))]: " choice
+        read -r -p "Выберите опцию [0-$((i-1))]: " choice
         echo
 
         case $choice in
@@ -1207,7 +1233,7 @@ show_menu() {
         esac
         
         echo
-        read -p "Нажмите Enter для продолжения..."
+        read -r -p "Нажмите Enter для продолжения..." || exit 0
     done
 }
 

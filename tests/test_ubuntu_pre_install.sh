@@ -102,6 +102,27 @@ for forwarding_mode in yes local remote no; do
 done
 assert_false 'invalid TCP forwarding mode rejected' render_ssh_dropin 'yes; Match all'
 
+(
+    command() { return 0; }
+    getent() { [[ "$1 $2" == 'passwd root' ]]; }
+    passwd() { [[ "$1" == root ]]; }
+    change_root_password >/dev/null
+) || { printf 'FAIL: root password change does not delegate to passwd root\n' >&2; failures=$((failures + 1)); }
+(
+    command() { return 0; }
+    getent() { return 1; }
+    passwd() { return 0; }
+    ! change_account_password missing-user >/dev/null
+) || { printf 'FAIL: missing account was accepted for password change\n' >&2; failures=$((failures + 1)); }
+if change_account_password 'root;id' >/dev/null 2>&1; then
+    printf 'FAIL: unsafe account name was accepted\n' >&2
+    failures=$((failures + 1))
+fi
+if sed -n '/^change_account_password()/,/^change_root_password()/p' "$ROOT_DIR/ubuntu_pre_install.sh" | grep -Eq 'chpasswd|read -s|root:\$password'; then
+    printf 'FAIL: password is still handled by shell variables or chpasswd\n' >&2
+    failures=$((failures + 1))
+fi
+
 [[ "$(vless_buffer_limit_for_ram 512)" == 8388608 ]] || failures=$((failures + 1))
 [[ "$(vless_buffer_limit_for_ram 960)" == 16777216 ]] || failures=$((failures + 1))
 [[ "$(vless_buffer_limit_for_ram 3921)" == 33554432 ]] || failures=$((failures + 1))
@@ -143,6 +164,40 @@ grep -q '/etc/sysctl.d/90-server-scripts-vless-tcp.conf' "$ROOT_DIR/ubuntu_pre_i
     printf 'FAIL: canonical VLESS sysctl profile path is missing\n' >&2
     failures=$((failures + 1))
 }
+
+ipv6_profile=$(render_ipv6_profile 1)
+grep -q '^net.ipv6.conf.all.disable_ipv6=1$' <<< "$ipv6_profile" || failures=$((failures + 1))
+grep -q '^net.ipv6.conf.default.disable_ipv6=1$' <<< "$ipv6_profile" || failures=$((failures + 1))
+assert_false 'invalid IPv6 state rejected' render_ipv6_profile 2
+
+ipv6_legacy_fixture=$(mktemp)
+trap 'rm -f "$dnscrypt_fixture" "$dnscrypt_main_fixture" "$ipv6_legacy_fixture"' EXIT
+printf '%s\n' \
+    '# keep me' \
+    '# Отключение IPv6' \
+    'net.ipv6.conf.all.disable_ipv6 = 1' \
+    'net.ipv6.conf.eth0.disable_ipv6 = 1' \
+    'net.ipv4.ip_forward = 0' > "$ipv6_legacy_fixture"
+ipv6_cleaned=$(render_ipv6_legacy_cleanup "$ipv6_legacy_fixture")
+grep -q '^# keep me$' <<< "$ipv6_cleaned" || failures=$((failures + 1))
+grep -q '^net.ipv4.ip_forward = 0$' <<< "$ipv6_cleaned" || failures=$((failures + 1))
+if grep -q 'disable_ipv6\|Отключение IPv6' <<< "$ipv6_cleaned"; then
+    printf 'FAIL: legacy IPv6 settings were not removed from rendered sysctl.conf\n' >&2
+    failures=$((failures + 1))
+fi
+grep -q '/etc/sysctl.d/90-server-scripts-ipv6.conf' "$ROOT_DIR/ubuntu_pre_install.sh" || {
+    printf 'FAIL: canonical IPv6 sysctl profile path is missing\n' >&2
+    failures=$((failures + 1))
+}
+ipv6_service=$(render_ipv6_service)
+grep -q '^After=network-online.target$' <<< "$ipv6_service" || failures=$((failures + 1))
+grep -q '^ExecStart=/usr/sbin/sysctl -p /etc/sysctl.d/90-server-scripts-ipv6.conf$' <<< "$ipv6_service" || failures=$((failures + 1))
+grep -q '^WantedBy=multi-user.target$' <<< "$ipv6_service" || failures=$((failures + 1))
+assert_false 'invalid IPv6 runtime expectation rejected' verify_ipv6_runtime 2
+if grep -Eq 'echo .*disable_ipv6.*>> /etc/sysctl.conf|sed -i .*disable_ipv6.* /etc/sysctl.conf' "$ROOT_DIR/ubuntu_pre_install.sh"; then
+    printf 'FAIL: legacy non-transactional IPv6 edits remain\n' >&2
+    failures=$((failures + 1))
+fi
 
 backup_line=$(grep -n 'cp -a /etc/ufw.*BACKUP_DIR/ufw' "$ROOT_DIR/ubuntu_pre_install.sh" | head -n1 | cut -d: -f1)
 reset_line=$(grep -n 'ufw --force reset' "$ROOT_DIR/ubuntu_pre_install.sh" | head -n1 | cut -d: -f1)
