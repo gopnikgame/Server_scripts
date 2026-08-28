@@ -66,6 +66,18 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
         fail "launcher accepted an incomplete download"
     fi
     [[ $(sha256sum "$MODULES_DIR/${MODULE_ORDER[0]}" | awk '{print $1}') == "$module_hash" ]] || fail "failed download changed active modules"
+
+    acquire_lock
+    if (acquire_lock); then fail "launcher allowed a concurrent instance"; fi
+
+    EXEC_CALLED=0
+    exec() {
+        [[ " $* " == *' SERVER_SCRIPTS_SKIP_REFRESH_ONCE=1 '* && " $* " == *' --no-refresh '* ]] \
+            || fail "launcher restart lost its loop-prevention arguments"
+        EXEC_CALLED=1
+    }
+    maybe_restart_launcher
+    [[ "$EXEC_CALLED" -eq 1 ]] || fail "launcher did not restart after replacing itself"
 )
 
 (
