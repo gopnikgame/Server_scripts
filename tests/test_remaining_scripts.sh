@@ -37,6 +37,11 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
     source "$ROOT_DIR/speed_dns.sh"
     _exists bash || fail "speed_dns command detection failed"
     [[ "$(_green ok)" == *ok* ]] || fail "speed_dns formatter failed"
+    dig_fixture=$';; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1\n;; Query time: 19 msec\n'
+    printf '%s' "$dig_fixture" | query_succeeded || fail "speed_dns rejected a successful dig response"
+    [[ $(printf '%s' "$dig_fixture" | parse_query_time) == 19 ]] || fail "speed_dns query-time parser failed"
+    failed_fixture=${dig_fixture/status: NOERROR/status: SERVFAIL}
+    if printf '%s' "$failed_fixture" | query_succeeded; then fail "speed_dns accepted SERVFAIL as success"; fi
 )
 
 (

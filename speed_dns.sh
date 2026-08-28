@@ -1,352 +1,319 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Функция для проверки существования команды
-_exists() {
-    command -v "$1" &>/dev/null
+# Version: 2.0.0
+# Description: DNS configuration, performance and DNSSEC diagnostics for Ubuntu
+
+set -Eeuo pipefail
+
+SCRIPT_VERSION='2.0.0'
+DNS_TIMEOUT="${DNS_TIMEOUT:-2}"
+DNS_TRIES="${DNS_TRIES:-1}"
+TRACE_MAX_HOPS="${TRACE_MAX_HOPS:-10}"
+readonly SCRIPT_VERSION DNS_TIMEOUT DNS_TRIES TRACE_MAX_HOPS
+
+DNS_NAMES=(Google Cloudflare AdGuard Quad9 OpenDNS NextDNS UncensoredDNS)
+DNS_ADDRESSES=(8.8.8.8 1.1.1.1 94.140.14.14 9.9.9.9 208.67.222.222 45.90.28.0 91.239.100.100)
+TEST_DOMAINS=(cloudflare.com google.com example.com)
+readonly DNS_NAMES DNS_ADDRESSES TEST_DOMAINS
+
+if [[ -t 1 ]]; then
+    RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[1;36m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
+fi
+readonly RED GREEN YELLOW CYAN NC
+
+_exists() { command -v "$1" >/dev/null 2>&1; }
+_red() { printf '%b%s%b\n' "$RED" "$1" "$NC"; }
+_green() { printf '%b%s%b\n' "$GREEN" "$1" "$NC"; }
+_yellow() { printf '%b%s%b\n' "$YELLOW" "$1" "$NC"; }
+_cyan() { printf '%b%s%b\n' "$CYAN" "$1" "$NC"; }
+
+section() {
+    printf '\n%b=== %s ===%b\n\n' "$CYAN" "$1" "$NC"
 }
 
-# Функции для цветного вывода
-_red() {
-    echo -e "\033[31m$1\033[0m"
+confirm() {
+    local answer
+    read -r -p "$1 [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
 }
 
-_green() {
-    echo -e "\033[32m$1\033[0m"
-}
-
-_yellow() {
-    echo -e "\033[33m$1\033[0m"
-}
-
-_cyan() {
-    echo -e "\033[1;36m$1\033[0m"
-}
-
-# Функция для автоматической установки необходимых утилит
-install_required_tools() {
-    local tool="$1"
-    local pkg="$2"
-    
-    if ! _exists "$tool"; then
-        echo " $(_yellow "Утилита $tool не найдена. Установка $pkg..."))"
-        
-        # Определяем пакетный менеджер
-        if _exists "apt-get"; then
-            apt-get update -qq && apt-get install -y "$pkg"
-        elif _exists "yum"; then
-            yum install -y "$pkg"
-        elif _exists "dnf"; then
-            dnf install -y "$pkg"
-        elif _exists "zypper"; then
-            zypper install -y "$pkg"
-        elif _exists "apk"; then
-            apk add "$pkg"
-        else
-            echo " $(_red "Не удалось определить пакетный менеджер. Установите $pkg вручную.")"
-            return 1
-        fi
-        
-        # Проверяем, установился ли пакет
-        if _exists "$tool"; then
-            echo " $(_green "✓ $tool успешно установлен.")"
-        else
-            echo " $(_red "✗ Не удалось установить $tool. Попробуйте установить вручную.")"
-            return 1
-        fi
-    fi
-    
-    return 0
-}
-
-# Проверка DNS-утечки
-check_dns_leak() {
-    echo
-    echo " $(_cyan "=== Проверка DNS-утечки (аналог BrowserLeaks) ===")"
-    
-    # Проверяем наличие утилит
-    install_required_tools "curl" "curl"
-    install_required_tools "jq" "jq"
-    install_required_tools "dig" "dnsutils"
-    
-    # Проверка через ipleak.net
-    echo
-    echo " $(_yellow "● IP и Провайдер:")"
-    
-    # Запрашиваем данные с ipleak.net
-    local ip_data
-    ip_data=$(curl --fail --silent --show-error --connect-timeout 5 --max-time 15 "https://ipleak.net/json/" 2>/dev/null || true)
-    
-    if [ -n "$ip_data" ]; then
-        if _exists "jq"; then
-            echo "$ip_data" | jq -r '"   IP: \(.ip)\n   Страна: \(.country_name)\n   Провайдер: \(.isp)"' 2>/dev/null
-        else
-            # Если jq не установлен или не работает, используем grep/sed
-            echo "   IP: $(echo "$ip_data" | grep -o '"ip":"[^"]*' | sed 's/"ip":"//')"
-            echo "   Страна: $(echo "$ip_data" | grep -o '"country_name":"[^"]*' | sed 's/"country_name":"//')"
-            echo "   Провайдер: $(echo "$ip_data" | grep -o '"isp":"[^"]*' | sed 's/"isp":"//')"
-        fi
-    else
-        echo " $(_red "   Не удалось получить данные с ipleak.net")"
-    fi
-    
-    # Проверка DNS-серверов
-    echo
-    echo " $(_yellow "● DNS-серверы:")"
-    
-    if _exists "dig"; then
-        local dns_ip
-        dns_ip=$(dig +short myip.opendns.com @resolver1.opendns.com 2>/dev/null)
-        if [ -n "$dns_ip" ]; then
-            echo "   DNS определяет ваш IP как: $dns_ip"
-        else
-            echo " $(_red "   Не удалось определить DNS IP")"
-        fi
-    fi
-    
-    echo "   Используемые DNS-серверы системой:"
-    if [ -f "/etc/resolv.conf" ]; then
-        grep nameserver /etc/resolv.conf | sed 's/nameserver/   /'
-    else
-        echo " $(_red "   Не удалось найти файл /etc/resolv.conf")"
-    fi
-    
-    # Дополнительная проверка через systemd-resolved, если доступно
-    if _exists "resolvectl"; then
-        echo
-        echo "   Настройки systemd-resolved:"
-        resolvectl status | grep "DNS Server" | sed 's/^/   /' || true
-    fi
-}
-
-# Тест DNS-серверов
-run_dns_test() {
-    echo
-    echo " ⌛ Тестирование DNS-серверов..."
-    
-    # Массив DNS-серверов для проверки
-    declare -A dns_servers
-    dns_servers["Google"]="8.8.8.8"
-    dns_servers["Cloudflare"]="1.1.1.1"
-    dns_servers["AdGuard"]="94.140.14.14"
-    dns_servers["Quad9"]="9.9.9.9"
-    dns_servers["OpenDNS"]="208.67.222.222"
-    dns_servers["NextDNS"]="45.90.28.0"
-    dns_servers["UncensoredDNS"]="91.239.100.100"
-    
-    # Сайты для проверки DNS
-    local test_domains=("google.com" "yandex.ru" "cloudflare.com")
-    
-    echo
-    printf " %-18s %-20s %-10s\n" "DNS Сервер" "Провайдер" "Время (мс)"
-    echo " -------------------------------------------------"
-    
-    # Установка и определение доступной утилиты для проверки DNS
-    local dns_tool=""
-    
-    # Пытаемся установить dig если нет ни dig, ни nslookup
-    if ! _exists "dig" && ! _exists "nslookup"; then
-        install_required_tools "dig" "dnsutils"
-    fi
-    
-    # Проверяем доступные инструменты
-    if _exists "dig"; then
-        dns_tool="dig"
-    elif _exists "nslookup"; then
-        dns_tool="nslookup"
-    else
-        echo " $(_red "Ошибка: Не найдены утилиты dig или nslookup и не удалось их установить.")"
+install_ubuntu_packages() {
+    local packages=("$@")
+    (( EUID == 0 )) || {
+        _red 'Для установки недостающих пакетов запустите модуль от root.'
         return 1
+    }
+    confirm "Установить недостающие пакеты: ${packages[*]}?" || return 1
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+}
+
+ensure_dig() {
+    _exists dig && return 0
+    _exists apt-get || { _red 'Не найден dig; поддерживается автоматическая установка только на Ubuntu/Debian.'; return 1; }
+    install_ubuntu_packages dnsutils && _exists dig
+}
+
+ensure_trace_tool() {
+    if _exists tracepath || _exists traceroute; then return 0; fi
+    _exists apt-get || { _red 'Не найден tracepath/traceroute.'; return 1; }
+    install_ubuntu_packages iputils-tracepath && _exists tracepath
+}
+
+validate_settings() {
+    [[ "$DNS_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || { _red 'DNS_TIMEOUT должен быть положительным целым числом.'; return 1; }
+    [[ "$DNS_TRIES" =~ ^[1-9][0-9]*$ ]] || { _red 'DNS_TRIES должен быть положительным целым числом.'; return 1; }
+    [[ "$TRACE_MAX_HOPS" =~ ^[1-9][0-9]*$ ]] || { _red 'TRACE_MAX_HOPS должен быть положительным целым числом.'; return 1; }
+}
+
+dig_query() {
+    local server="$1" domain="$2" transport="${3:-udp}"
+    local -a args=("$domain" A "+time=$DNS_TIMEOUT" "+tries=$DNS_TRIES" +noall +comments +answer +stats)
+    [[ -n "$server" ]] && args=("@$server" "${args[@]}")
+    [[ "$transport" == tcp ]] && args+=(+tcp)
+    dig "${args[@]}" 2>/dev/null
+}
+
+parse_query_time() {
+    awk '/^;; Query time:/ { print $4; exit }'
+}
+
+query_succeeded() {
+    awk '
+        /status: NOERROR/ { valid_status=1 }
+        /ANSWER: [1-9][0-9]*/ { has_answer=1 }
+        END { exit !(valid_status && has_answer) }
+    '
+}
+
+query_status() {
+    sed -n 's/^;; ->>HEADER<<- .*status: \([^,]*\),.*/\1/p' | head -n 1
+}
+
+resolver_exit_ip() {
+    ensure_dig >/dev/null || return 1
+    dig whoami.akamai.net A +short "+time=$DNS_TIMEOUT" "+tries=$DNS_TRIES" 2>/dev/null | awk 'NF {print; exit}'
+}
+
+public_exit_ip() {
+    _exists curl || return 1
+    curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+        --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null
+}
+
+show_system_dns() {
+    section 'Текущая конфигурация DNS'
+    printf 'Хост: %s\n' "$(hostname)"
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        printf 'ОС: %s\n' "${PRETTY_NAME:-не определена}"
     fi
-    
-    for provider in "${!dns_servers[@]}"; do
-        local server=${dns_servers[$provider]}
-        local total_time=0
-        local count=0
-        local start_time result end_time query_time
-        
-        for domain in "${test_domains[@]}"; do
-            if [ "$dns_tool" = "dig" ]; then
-                # Используем dig с увеличенным таймаутом
-                start_time=$(date +%s%N)
-                result=$(dig "@$server" "$domain" +short +time=2 +retry=1 2>/dev/null)
-                end_time=$(date +%s%N)
-                
-                if [ -n "$result" ]; then
-                    # Расчет времени в миллисекундах (ms)
-                    query_time=$(( (end_time - start_time) / 1000000 ))
-                    total_time=$((total_time + query_time))
-                    count=$((count + 1))
-                fi
-            else
-                # Используем nslookup с таймером
-                start_time=$(date +%s%N)
-                result=$(nslookup -timeout=2 "$domain" "$server" 2>/dev/null)
-                end_time=$(date +%s%N)
-                
-                # Проверяем, что запрос был успешным
-                if echo "$result" | grep -q "Address:" && ! echo "$result" | grep -q "server can't find"; then
-                    # Расчет времени в миллисекундах (ms)
-                    query_time=$(( (end_time - start_time) / 1000000 ))
-                    total_time=$((total_time + query_time))
-                    count=$((count + 1))
+    printf 'resolv.conf: %s\n' "$(readlink -f /etc/resolv.conf 2>/dev/null || printf '/etc/resolv.conf')"
+    awk '$1 == "nameserver" { printf "  nameserver: %s\n", $2 }' /etc/resolv.conf 2>/dev/null || true
+
+    if _exists resolvectl; then
+        echo
+        echo 'Фактические DNS-серверы systemd-resolved:'
+        resolvectl dns 2>/dev/null | sed 's/^/  /' || true
+        resolvectl domain 2>/dev/null | sed 's/^/  /' || true
+        echo
+        resolvectl status --no-pager 2>/dev/null | \
+            awk '/DNSOverTLS setting:|DNSSEC setting:|Current DNS Server:|DNS Servers:/ {sub(/^[[:space:]]+/, ""); print "  " $0}' || true
+    fi
+
+    if ensure_dig; then
+        local output status latency
+        output=$(dig_query '' cloudflare.com udp || true)
+        status=$(printf '%s\n' "$output" | query_status)
+        latency=$(printf '%s\n' "$output" | parse_query_time)
+        printf '\nСистемное разрешение cloudflare.com: %s, %s мс\n' "${status:-ошибка}" "${latency:--}"
+    fi
+}
+
+show_egress_context() {
+    section 'Контекст выхода DNS'
+    local public_ip='' resolver_ip=''
+    public_ip=$(public_exit_ip || true)
+    resolver_ip=$(resolver_exit_ip || true)
+    printf 'Публичный IP сервера: %s\n' "${public_ip:-не определён}"
+    printf 'IP рекурсивного резолвера по whoami.akamai.net: %s\n' "${resolver_ip:-не определён}"
+    echo
+    echo 'Это серверная диагностика, а не браузерный DNS leak test.'
+    echo 'Разные IP обычно означают использование внешнего рекурсивного резолвера;'
+    echo 'совпадение IP само по себе не доказывает утечку.'
+}
+
+benchmark_resolvers() {
+    ensure_dig || return 1
+    section 'Сравнение публичных DNS-резолверов'
+    printf '%-17s %-15s %9s %9s %9s %8s\n' 'Провайдер' 'Адрес' 'Среднее' 'Мин.' 'Макс.' 'Успех'
+    printf '%-17s %-15s %9s %9s %9s %8s\n' '-----------------' '---------------' '---------' '---------' '---------' '--------'
+
+    local index domain output time success total min max average
+    local best_name='' best_address='' best_average=999999
+    for index in "${!DNS_NAMES[@]}"; do
+        success=0; total=0; min=999999; max=0
+        for domain in "${TEST_DOMAINS[@]}"; do
+            output=$(dig_query "${DNS_ADDRESSES[$index]}" "$domain" udp || true)
+            if printf '%s\n' "$output" | query_succeeded; then
+                time=$(printf '%s\n' "$output" | parse_query_time)
+                if [[ "$time" =~ ^[0-9]+$ ]]; then
+                    (( success += 1, total += time ))
+                    (( time < min )) && min=$time
+                    (( time > max )) && max=$time
                 fi
             fi
         done
-        
-        if [[ $count -gt 0 ]]; then
-            local avg_time=$((total_time / count))
-            
-            # Цветовое отображение в зависимости от скорости
-            if [[ $avg_time -lt 30 ]]; then
-                printf " %-18s %-20s $(_green "%-10s")\n" "$server" "$provider" "${avg_time} мс"
-            elif [[ $avg_time -lt 60 ]]; then
-                printf " %-18s %-20s $(_yellow "%-10s")\n" "$server" "$provider" "${avg_time} мс"
-            else
-                printf " %-18s %-20s $(_red "%-10s")\n" "$server" "$provider" "${avg_time} мс"
+        if (( success > 0 )); then
+            average=$((total / success))
+            printf '%-17s %-15s %7d ms %7d ms %7d ms %5d/%d\n' \
+                "${DNS_NAMES[$index]}" "${DNS_ADDRESSES[$index]}" "$average" "$min" "$max" "$success" "${#TEST_DOMAINS[@]}"
+            if (( success == ${#TEST_DOMAINS[@]} && average < best_average )); then
+                best_name="${DNS_NAMES[$index]}"
+                best_address="${DNS_ADDRESSES[$index]}"
+                best_average=$average
             fi
         else
-            printf " %-18s %-20s $(_red "%-10s")\n" "$server" "$provider" "ошибка"
+            printf '%-17s %-15s %9s %9s %9s %8s\n' \
+                "${DNS_NAMES[$index]}" "${DNS_ADDRESSES[$index]}" 'ошибка' '-' '-' "0/${#TEST_DOMAINS[@]}"
         fi
     done
     echo
+    if [[ -n "$best_name" ]]; then
+        _green "Лучший полный результат: $best_name ($best_address), в среднем ${best_average} мс."
+    fi
+    echo 'Время берётся из поля Query time утилиты dig; запуск процесса в замер не входит.'
+    echo 'Частичный успех явно показан и не считается полноценным результатом.'
 }
 
-run_traceroute() {
-    echo
-    echo " ⌛ Проверка маршрута к популярным DNS-серверам..."
-    
-    # Установка утилиты трассировки если отсутствует
-    if ! _exists "traceroute" && ! _exists "tracepath"; then
-        if ! install_required_tools "traceroute" "traceroute"; then
-            install_required_tools "tracepath" "iputils-tracepath"
-        fi
-    fi
-    
-    # Проверяем наличие команды traceroute или tracepath
-    if _exists "traceroute"; then
-        local cmd="traceroute"
-    elif _exists "tracepath"; then
-        local cmd="tracepath"
-    else
-        echo " $(_red "Ошибка: Не удалось установить traceroute/tracepath!")"
-        return 1
-    fi
-    
-    # Ассоциативный массив DNS-серверов (в bash 4.0+)
-    declare -A dns_servers=(
-        ["Google"]="8.8.8.8"
-        ["Cloudflare"]="1.1.1.1"
-        ["AdGuard"]="94.140.14.14"
-        ["Quad9"]="9.9.9.9"
-        ["OpenDNS"]="208.67.222.222"
-        ["NextDNS"]="45.90.28.0"
-        ["UncensoredDNS"]="91.239.100.100"
-    )
-    
-    # Для совместимости с bash < 4.0 можно использовать два массива:
-    # dns_names=("Google" "Cloudflare" ...)
-    # dns_ips=("8.8.8.8" "1.1.1.1" ...)
-    
-    for dns_name in "${!dns_servers[@]}"; do
-        local target=${dns_servers[$dns_name]}
-        echo
-        echo " $(_yellow "★") Маршрут к $dns_name DNS (${target}):"
-        
-        # Ограничиваем трассировку 10 хопами для ускорения
-        if [[ "$cmd" == "traceroute" ]]; then
-            "$cmd" -m 10 -w 2 "$target" 2>&1 | grep -Fv '* * *' | head -n 15
+tcp_reachability() {
+    ensure_dig || return 1
+    section 'Доступность DNS по TCP/53'
+    local index output latency
+    printf '%-17s %-15s %12s\n' 'Провайдер' 'Адрес' 'TCP'
+    for index in "${!DNS_NAMES[@]}"; do
+        output=$(dig_query "${DNS_ADDRESSES[$index]}" cloudflare.com tcp || true)
+        if printf '%s\n' "$output" | query_succeeded; then
+            latency=$(printf '%s\n' "$output" | parse_query_time)
+            printf '%-17s %-15s %9s ms\n' "${DNS_NAMES[$index]}" "${DNS_ADDRESSES[$index]}" "${latency:--}"
         else
-            "$cmd" -m 10 "$target" 2>&1 | grep -Fv '(mtu' | grep -Fv 'no reply' | head -n 15
+            printf '%-17s %-15s %12s\n' "${DNS_NAMES[$index]}" "${DNS_ADDRESSES[$index]}" 'недоступен'
         fi
     done
-    echo
 }
 
-# Генерация отчета
-generate_report() {
-    echo
-    echo "╔══════════════════════════════════════════════════════════════════╗"
-    echo "║                   ОТЧЁТ О ПРОВЕРКЕ DNS И СЕТИ                    ║"
-    echo "╚══════════════════════════════════════════════════════════════════╝"
-    echo
-    echo "$(_yellow "▶") Дата проверки: $(date '+%d.%m.%Y %H:%M:%S')"
-    echo
-    echo "$(_yellow "▶") Информация о системе:"
-    echo "   Хост: $(hostname)"
-    if _exists "lsb_release"; then
-        echo "   ОС: $(lsb_release -ds 2>/dev/null)"
-    elif [ -f "/etc/os-release" ]; then
-        echo "   ОС: $(grep -oP '(?<=^PRETTY_NAME=).+' /etc/os-release | tr -d '"')"
+dnssec_status_for() {
+    local server="$1" output status positive_output positive_status
+    local -a common=(A +dnssec "+time=$DNS_TIMEOUT" "+tries=$DNS_TRIES" +noall +comments +stats)
+    local -a positive_args=(cloudflare.com "${common[@]}") invalid_args=(dnssec-failed.org "${common[@]}")
+    if [[ -n "$server" ]]; then
+        positive_args=("@$server" "${positive_args[@]}")
+        invalid_args=("@$server" "${invalid_args[@]}")
     fi
+    positive_output=$(dig "${positive_args[@]}" 2>/dev/null || true)
+    positive_status=$(printf '%s\n' "$positive_output" | query_status)
+    [[ "$positive_status" == NOERROR ]] || { printf 'нет корректного контрольного ответа'; return 0; }
+    output=$(dig "${invalid_args[@]}" 2>/dev/null || true)
+    status=$(printf '%s\n' "$output" | query_status)
+    case "$status" in
+        SERVFAIL) printf 'проверяет DNSSEC' ;;
+        NOERROR) printf 'не проверяет DNSSEC' ;;
+        '') printf 'нет ответа' ;;
+        *) printf 'неопределённо (%s)' "$status" ;;
+    esac
+}
+
+check_dnssec() {
+    ensure_dig || return 1
+    section 'Проверка валидации DNSSEC'
+    printf '%-17s %-15s %s\n' 'Резолвер' 'Адрес' 'Результат'
+    printf '%-17s %-15s %s\n' 'Системный' '-' "$(dnssec_status_for '')"
+    local index
+    for index in "${!DNS_NAMES[@]}"; do
+        printf '%-17s %-15s %s\n' "${DNS_NAMES[$index]}" "${DNS_ADDRESSES[$index]}" \
+            "$(dnssec_status_for "${DNS_ADDRESSES[$index]}")"
+    done
     echo
-    echo "$(_yellow "▶") Текущие настройки DNS:"
-    if [ -f "/etc/resolv.conf" ]; then
-        grep nameserver /etc/resolv.conf | sed 's/nameserver/   Nameserver:/'
-    fi
-    
-    # Проверка расширенных настроек resolved.conf, если доступны
-    if [ -f "/etc/systemd/resolved.conf" ] && command -v resolvectl &>/dev/null; then
+    echo 'Проверка использует домен с намеренно повреждённой DNSSEC-подписью:'
+    echo 'валидирующий резолвер должен вернуть SERVFAIL.'
+}
+
+trace_resolvers() {
+    ensure_trace_tool || return 1
+    section 'Маршруты к DNS-серверам'
+    local index target
+    for index in "${!DNS_NAMES[@]}"; do
+        target="${DNS_ADDRESSES[$index]}"
+        printf '\n%s (%s):\n' "${DNS_NAMES[$index]}" "$target"
+        if _exists tracepath; then
+            timeout 25 tracepath -n -m "$TRACE_MAX_HOPS" "$target" 2>&1 || _yellow '  Маршрут не завершён в пределах лимита.'
+        else
+            timeout 25 traceroute -n -m "$TRACE_MAX_HOPS" -w 2 "$target" 2>&1 || _yellow '  Маршрут не завершён в пределах лимита.'
+        fi
+    done
+}
+
+full_report() {
+    printf '\nDNS И СЕТЕВОЙ ОТЧЁТ v%s — %s\n' "$SCRIPT_VERSION" "$(date '+%d.%m.%Y %H:%M:%S')"
+    show_system_dns
+    show_egress_context
+    benchmark_resolvers
+    tcp_reachability
+    check_dnssec
+}
+
+usage() {
+    cat <<'USAGE'
+Использование: speed_dns.sh [--all|--system|--benchmark|--tcp|--dnssec|--trace]
+Без аргументов открывается интерактивное меню.
+USAGE
+}
+
+interactive_menu() {
+    while true; do
+        section "DNS DIAGNOSTICS v$SCRIPT_VERSION"
+        echo '1. Полный отчёт (без трассировки)'
+        echo '2. Текущая конфигурация и контекст выхода DNS'
+        echo '3. Сравнить скорость публичных DNS'
+        echo '4. Проверить TCP/53'
+        echo '5. Проверить DNSSEC'
+        echo '6. Выполнить трассировку'
+        echo '0. Вернуться в главное меню'
+        local choice
+        read -r -p 'Выберите действие: ' choice
+        case "$choice" in
+            1) full_report ;;
+            2) show_system_dns; show_egress_context ;;
+            3) benchmark_resolvers ;;
+            4) tcp_reachability ;;
+            5) check_dnssec ;;
+            6) trace_resolvers ;;
+            0) return 0 ;;
+            *) _red 'Неверный выбор.' ;;
+        esac
         echo
-        echo "$(_yellow "▶") Расширенные настройки DNS (systemd-resolved):"
-        echo "   Серверы DNS:"
-        resolvectl dns 2>/dev/null | grep -v "Link " | sed 's/^/   /'
-        
-        # Проверка статуса DNSSEC
-        local dnssec_status
-        dnssec_status=$(resolvectl status 2>/dev/null | grep "DNSSEC setting" | sed 's/^[[:space:]]*//' || true)
-        if [ -n "$dnssec_status" ]; then
-            echo "   $dnssec_status"
-        fi
-        
-        # Проверка статуса кеширования
-        if grep -q "^Cache=yes" /etc/systemd/resolved.conf 2>/dev/null; then
-            echo "   Кеширование DNS: Включено"
-        elif grep -q "^Cache=no" /etc/systemd/resolved.conf 2>/dev/null; then
-            echo "   Кеширование DNS: Отключено"
-        fi
-    fi
-    
-    # Запуск проверки DNS утечек
-    check_dns_leak
-    
-    echo
-    echo "$(_yellow "▶") Результаты тестирования DNS:"
-    echo "   $(_green "< 30 мс") - отличное время отклика"
-    echo "   $(_yellow "30-60 мс") - хорошее время отклика"
-    echo "   $(_red "> 60 мс") - медленное время отклика"
-    
-    # Запуск теста DNS
-    run_dns_test
-    
-    # Запуск трассировки
-    run_traceroute
-    
-    echo
-    echo "$(_yellow "▶") РЕКОМЕНДАЦИИ:"
-    echo "   1. DNS-серверы с временем отклика менее 30 мс обеспечат наилучшую производительность при веб-серфинге."
-    echo "   2. При выборе DNS-сервера учитывайте не только скорость, но и приватность, фильтрацию контента."
-    echo "   3. Для улучшения производительности можно настроить использование нескольких DNS-серверов."
-    echo "   4. Трассировка показывает количество переходов до целевых серверов - меньшее количество обычно означает более быстрое соединение."
-    echo "   5. Если ваш реальный IP отличается от IP, определяемого через DNS, возможна DNS-утечка."
-    echo
-    echo "╔══════════════════════════════════════════════════════════════════╗"
-    echo "║                          КОНЕЦ ОТЧЁТА                            ║"
-    echo "╚══════════════════════════════════════════════════════════════════╝"
+        read -r -p 'Нажмите Enter для продолжения...'
+    done
 }
 
-# Главная функция
 main() {
-    # Проверка наличия root-прав
-    if [ "$(id -u)" -ne 0 ]; then
-        echo " $(_red "Скрипт должен быть запущен с привилегиями root или sudo!")"
-        exit 1
-    fi
-    
-    # Запуск отчета
-    generate_report
+    validate_settings
+    case "${1:-}" in
+        '') interactive_menu ;;
+        --all) full_report ;;
+        --system) show_system_dns; show_egress_context ;;
+        --benchmark) benchmark_resolvers ;;
+        --tcp) tcp_reachability ;;
+        --dnssec) check_dnssec ;;
+        --trace) trace_resolvers ;;
+        -h|--help) usage ;;
+        *) usage >&2; return 2 ;;
+    esac
 }
 
-# Запуск скрипта
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     main "$@"
 fi
