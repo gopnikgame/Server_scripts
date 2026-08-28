@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Version: 2.0.0
-# Official references checked 2026-08-14:
+# Version: 2.1.0
+# Official references checked 2026-08-28:
 # https://manpages.debian.org/unstable/apt/apt-get.8.en.html
 # https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html
 set -Eeuo pipefail
 
-readonly VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly RED='\033[0;31m' GREEN='\033[0;32m' YELLOW='\033[1;33m' BLUE='\033[0;34m' NC='\033[0m'
 readonly CONFIG_FILE="/etc/server-scripts-update.conf"
 readonly RUNNER_FILE="/usr/local/sbin/server-scripts-update-runner"
@@ -17,6 +17,11 @@ readonly LEGACY_CRON="/etc/cron.d/auto_update_vps"
 readonly LEGACY_RUNNER="/usr/local/sbin/auto_update_script.sh"
 readonly LEGACY_CONFIG="/etc/auto_update_vps.conf"
 readonly LEGACY_APT_CONFIG="/etc/apt/apt.conf.d/99auto-update"
+readonly -a APT_NETWORK_OPTIONS=(
+    -o Acquire::Retries=10
+    -o Acquire::http::Timeout=180
+    -o Acquire::https::Timeout=180
+)
 
 print_header() { printf '\n%b=== %s ===%b\n\n' "$BLUE" "$1" "$NC"; }
 print_step() { printf '%b→%b %s\n' "$YELLOW" "$NC" "$1"; }
@@ -32,9 +37,9 @@ require_supported_system() {
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-}" in debian|ubuntu) ;; *) print_error "Поддерживаются Debian и Ubuntu (обнаружено: ${ID:-неизвестно})."; return 1 ;; esac
-    command -v apt-get >/dev/null && command -v dpkg >/dev/null && command -v flock >/dev/null || {
+    if ! command -v apt-get >/dev/null || ! command -v dpkg >/dev/null || ! command -v flock >/dev/null; then
         print_error "Нужны apt-get, dpkg и flock."; return 1;
-    }
+    fi
 }
 
 with_lock() {
@@ -53,7 +58,10 @@ preflight() {
     print_step "Проверка dpkg, зависимостей и свободного места"
     local audit; audit="$(dpkg --audit 2>&1 || true)"
     [[ -z "$audit" ]] || { print_error "dpkg сообщает о незавершённых операциях:"; printf '%s\n' "$audit"; return 1; }
-    apt-get check
+    if ! apt-get check; then
+        print_error "APT сообщает о нарушенных зависимостях. Обновление остановлено."
+        return 1
+    fi
     df -h / /boot 2>/dev/null || df -h /
 }
 
@@ -99,6 +107,12 @@ check_protected_removals() {
 }
 
 service_state() { systemctl is-active --quiet "$1" 2>/dev/null && printf active || printf inactive; }
+timer_enabled_status() {
+    local status
+    status=$(systemctl is-enabled server-scripts-update.timer 2>/dev/null || true)
+    [[ "$status" != not-found ]] || status="не настроен"
+    printf '%s\n' "${status:-не настроен}"
+}
 postflight() {
     local ssh_before="$1" xray_before="$2" failed=0
     print_step "Контроль после обновления"
@@ -142,7 +156,11 @@ disable_legacy() {
 perform_update() {
     local mode="$1" plan backup ssh_before xray_before
     preflight || return 1
-    print_step "Обновление индексов APT"; apt-get update
+    print_step "Обновление индексов APT"
+    if ! apt-get "${APT_NETWORK_OPTIONS[@]}" --error-on=any update; then
+        print_error "Не удалось обновить индексы APT. Пакеты не изменялись."
+        return 1
+    fi
     plan="$(simulation "$mode")" || { print_error "APT не смог построить план."; return 1; }
     printf '\n%s\n' "$plan"
     check_protected_removals < <(printf '%s\n' "$plan" | simulation_removals) || {
@@ -150,13 +168,29 @@ perform_update() {
     }
     grep -qE '^(Inst|Remv|Conf) ' <<< "$plan" || { print_success "Доступных обновлений нет."; return 0; }
     confirm "Применить этот план без autoremove и перезагрузки?" || { print_warning "Отменено."; return 0; }
-    backup="$(create_snapshot)"; print_success "Снимок состояния: $backup"
+    if ! backup="$(create_snapshot)"; then
+        print_error "Не удалось создать снимок состояния пакетов. Обновление не начато."
+        return 1
+    fi
+    print_success "Снимок состояния: $backup"
     ssh_before="$(service_state ssh)"; [[ "$ssh_before" == active ]] || ssh_before="$(service_state sshd)"
     xray_before="$(service_state xray)"
     export DEBIAN_FRONTEND=noninteractive
     case "$mode" in
-        safe) apt-get upgrade --with-new-pkgs --no-remove -y -o Dpkg::Options::=--force-confold ;;
-        expanded) apt-get dist-upgrade --no-remove -y -o Dpkg::Options::=--force-confold ;;
+        safe)
+            if ! apt-get "${APT_NETWORK_OPTIONS[@]}" upgrade --with-new-pkgs --no-remove -y -o Dpkg::Options::=--force-confold; then
+                print_error "APT не завершил безопасное обновление. Снимок состояния: $backup"
+                postflight "$ssh_before" "$xray_before" || true
+                return 1
+            fi
+            ;;
+        expanded)
+            if ! apt-get "${APT_NETWORK_OPTIONS[@]}" dist-upgrade --no-remove -y -o Dpkg::Options::=--force-confold; then
+                print_error "APT не завершил расширенное обновление. Снимок состояния: $backup"
+                postflight "$ssh_before" "$xray_before" || true
+                return 1
+            fi
+            ;;
     esac
     postflight "$ssh_before" "$xray_before"
 }
@@ -167,7 +201,7 @@ show_status() {
     . /etc/os-release
     printf 'Система: %s\nЯдро: %s\nПерезагрузка: %s\nТаймер: %s\n' "${PRETTY_NAME:-неизвестно}" "$(uname -r)" \
         "$([[ -e /var/run/reboot-required ]] && echo требуется || echo 'не требуется')" \
-        "$(systemctl is-enabled server-scripts-update.timer 2>/dev/null || echo 'не настроен')"
+        "$(timer_enabled_status)"
     printf '\nОбновления по текущим индексам:\n'
     apt-get -s upgrade --with-new-pkgs --no-remove 2>/dev/null | grep '^Inst ' || echo "  не найдены или индексы устарели"
     printf '\nСлужбы с ошибками:\n'; systemctl --failed --no-pager 2>/dev/null || true
@@ -192,12 +226,41 @@ calendar_for_period() {
     esac
 }
 
+scheduler_files() {
+    printf '%s\n' "$RUNNER_FILE" "$CONFIG_FILE" "$SERVICE_FILE" "$TIMER_FILE"
+}
+
+backup_scheduler_state() {
+    local dir file
+    dir="$BACKUP_ROOT/scheduler-$(date +%Y%m%d-%H%M%S)"
+    install -d -m 0700 "$dir" || return 1
+    systemctl is-enabled server-scripts-update.timer > "$dir/timer-enabled.txt" 2>/dev/null || printf 'disabled\n' > "$dir/timer-enabled.txt"
+    while IFS= read -r file; do
+        if [[ -e "$file" ]] && ! cp -a "$file" "$dir/"; then
+            return 1
+        fi
+    done < <(scheduler_files)
+    printf '%s\n' "$dir"
+}
+
+restore_scheduler_state() {
+    local dir="$1" file saved enabled
+    systemctl disable --now server-scripts-update.timer >/dev/null 2>&1 || true
+    while IFS= read -r file; do
+        saved="$dir/$(basename "$file")"
+        if [[ -e "$saved" ]]; then cp -a "$saved" "$file"; else rm -f "$file"; fi
+    done < <(scheduler_files)
+    systemctl daemon-reload || true
+    enabled=$(cat "$dir/timer-enabled.txt" 2>/dev/null || printf disabled)
+    [[ "$enabled" != enabled ]] || systemctl enable --now server-scripts-update.timer >/dev/null 2>&1 || true
+}
+
 install_scheduler() {
     command -v systemctl >/dev/null || { print_error "systemd не найден."; return 1; }
     legacy_present && { print_error "Сначала обезвредьте старую версию через пункт 9."; return 1; }
     print_header "Расписание безопасных обновлений"
     echo "1. Ежедневно"; echo "2. Еженедельно (рекомендуется)"; echo "3. Ежемесячно"
-    local choice period time mode calendar
+    local choice period time mode calendar backup temporary
     read -r -p "Период [1-3]: " choice
     case "$choice" in 1) period=daily ;; 2) period=weekly ;; 3) period=monthly ;; *) print_error "Неверный выбор."; return 1 ;; esac
     read -r -p "Время ЧЧ:ММ [03:00]: " time; time="${time:-03:00}"
@@ -207,14 +270,19 @@ install_scheduler() {
     case "$choice" in 1) mode=check ;; 2) mode=upgrade ;; *) print_error "Неверный выбор."; return 1 ;; esac
     [[ "$mode" == check ]] || confirm "Разрешить плановую установку без reboot и autoremove?" || return 0
     calendar="$(calendar_for_period "$period" "$time")"
-    install -d -m 0755 "$(dirname "$RUNNER_FILE")"
-    cat > "$RUNNER_FILE" <<'RUNNER'
+    if ! backup="$(backup_scheduler_state)"; then
+        print_error "Не удалось создать резервную копию расписания."
+        return 1
+    fi
+    temporary=$(mktemp -d)
+    cat > "$temporary/runner" <<'RUNNER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 exec 9>/run/lock/server-scripts-update.lock
 flock -n 9 || exit 0
 mode="${1:-check}"
-apt-get update
+apt_options=(-o Acquire::Retries=10 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180)
+apt-get "${apt_options[@]}" --error-on=any update
 apt-get check
 case "$mode" in
  check) apt-get -s upgrade --with-new-pkgs --no-remove ;;
@@ -230,7 +298,7 @@ case "$mode" in
   systemctl is-active --quiet sshd 2>/dev/null && ssh_before=active || true
   systemctl is-active --quiet xray 2>/dev/null && xray_before=active || true
   export DEBIAN_FRONTEND=noninteractive
-  apt-get upgrade --with-new-pkgs --no-remove -y -o Dpkg::Options::=--force-confold
+  apt-get "${apt_options[@]}" upgrade --with-new-pkgs --no-remove -y -o Dpkg::Options::=--force-confold
   test -z "$(dpkg --audit 2>&1 || true)"; apt-get check
   [ "$ssh_before" != active ] || systemctl is-active --quiet ssh 2>/dev/null || systemctl is-active --quiet sshd
   [ "$xray_before" != active ] || systemctl is-active --quiet xray
@@ -241,9 +309,8 @@ case "$mode" in
  *) echo "Неизвестный режим: $mode" >&2; exit 2 ;;
 esac
 RUNNER
-    chmod 0755 "$RUNNER_FILE"
-    printf 'MODE=%s\nPERIOD=%s\nTIME=%s\n' "$mode" "$period" "$time" > "$CONFIG_FILE"; chmod 0600 "$CONFIG_FILE"
-    cat > "$SERVICE_FILE" <<EOF
+    printf 'MODE=%s\nPERIOD=%s\nTIME=%s\n' "$mode" "$period" "$time" > "$temporary/config"
+    cat > "$temporary/service" <<EOF
 [Unit]
 Description=Server Scripts safe APT maintenance
 After=network-online.target
@@ -252,7 +319,7 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$RUNNER_FILE $mode
 EOF
-    cat > "$TIMER_FILE" <<EOF
+    cat > "$temporary/timer" <<EOF
 [Unit]
 Description=Schedule Server Scripts safe APT maintenance
 [Timer]
@@ -263,15 +330,42 @@ Unit=server-scripts-update.service
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl daemon-reload; systemctl enable --now server-scripts-update.timer
+    if ! install -d -m 0755 "$(dirname "$RUNNER_FILE")" ||
+        ! install -m 0755 "$temporary/runner" "$RUNNER_FILE" ||
+        ! install -m 0600 "$temporary/config" "$CONFIG_FILE" ||
+        ! install -m 0644 "$temporary/service" "$SERVICE_FILE" ||
+        ! install -m 0644 "$temporary/timer" "$TIMER_FILE"; then
+        rm -rf -- "$temporary"
+        restore_scheduler_state "$backup"
+        print_error "Не удалось атомарно установить файлы расписания; прежнее состояние восстановлено."
+        return 1
+    fi
+    rm -rf -- "$temporary"
+    if ! systemd-analyze verify "$SERVICE_FILE" "$TIMER_FILE"; then
+        restore_scheduler_state "$backup"
+        print_error "Проверка systemd завершилась ошибкой; прежнее состояние восстановлено."
+        return 1
+    fi
+    if ! systemctl daemon-reload || ! systemctl enable --now server-scripts-update.timer; then
+        restore_scheduler_state "$backup"
+        print_error "Не удалось активировать timer; прежнее состояние восстановлено."
+        return 1
+    fi
     systemctl list-timers server-scripts-update.timer --no-pager
-    print_success "Расписание установлено. Автоматические reboot и autoremove отключены."
+    print_success "Расписание установлено. Резервная копия: $backup"
+    print_success "Автоматические reboot и autoremove отключены."
 }
 
 disable_scheduler() {
     systemctl disable --now server-scripts-update.timer 2>/dev/null || true
-    rm -f "$SERVICE_FILE" "$TIMER_FILE" "$RUNNER_FILE" "$CONFIG_FILE"
-    systemctl daemon-reload 2>/dev/null || true
+    if ! rm -f "$SERVICE_FILE" "$TIMER_FILE" "$RUNNER_FILE" "$CONFIG_FILE"; then
+        print_error "Не удалось удалить один или несколько файлов расписания."
+        return 1
+    fi
+    if ! systemctl daemon-reload; then
+        print_error "Файлы удалены, но systemd daemon-reload завершился ошибкой."
+        return 1
+    fi
     print_success "Расписание удалено; журнал сохранён."
 }
 view_logs() { journalctl -u server-scripts-update.service -n 150 --no-pager 2>/dev/null || print_warning "Журнал пуст."; }
@@ -284,7 +378,7 @@ manual_reboot() {
 main_menu() {
     require_root; require_supported_system
     while true; do
-        print_header "Безопасное обновление VPS v$VERSION"
+        print_header "Безопасное обновление VPS v$SCRIPT_VERSION"
         echo "1. Состояние и доступные обновления"
         echo "2. Безопасное обновление (рекомендуется)"
         echo "3. Расширенное обновление без удаления пакетов"

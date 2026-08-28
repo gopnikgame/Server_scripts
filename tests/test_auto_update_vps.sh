@@ -30,11 +30,44 @@ assert_eq '*-*-01 23:59:00' "$(calendar_for_period monthly 23:59)" 'monthly cale
 assert_true 'valid strict time' valid_time 09:07
 assert_false 'reject missing leading zero' valid_time 9:07
 assert_false 'reject invalid hour' valid_time 24:00
+assert_true 'real os-release can be loaded without readonly collisions' require_supported_system
+systemctl() { printf 'not-found\n'; return 1; }
+assert_eq 'не настроен' "$(timer_enabled_status)" 'timer status is not duplicated'
+unset -f systemctl
 
 plan=$'Inst openssl [1] (2 Debian:stable)\nRemv linux-image-6.18.1-x64v2-xanmod1 [6.18.1]\nRemv old-library [1]'
 assert_eq $'linux-image-6.18.1-x64v2-xanmod1\nold-library' "$(printf '%s\n' "$plan" | simulation_removals)" 'parse removals'
 assert_false 'protected removal blocks plan' check_protected_removals <<< 'linux-image-6.18.1-x64v2-xanmod1'
 assert_true 'ordinary removal passes guard' check_protected_removals <<< 'old-library'
+
+(
+    preflight() { return 0; }
+    apt-get() { return 42; }
+    simulation() { printf 'Inst fixture [1] (2 test)\n'; }
+    confirm() { return 0; }
+    create_snapshot() { printf '/tmp/should-not-exist\n'; }
+    service_state() { printf inactive; }
+    postflight() { return 0; }
+    if perform_update safe >/dev/null 2>&1; then
+        printf 'FAIL: apt-get update failure was reported as success\n' >&2
+        exit 1
+    fi
+) || ((failures++))
+
+(
+    apt_calls=0
+    preflight() { return 0; }
+    apt-get() { apt_calls=$((apt_calls + 1)); (( apt_calls == 1 )) && return 0; return 42; }
+    simulation() { printf 'Inst fixture [1] (2 test)\n'; }
+    confirm() { return 0; }
+    create_snapshot() { printf '/tmp/fixture-snapshot\n'; }
+    service_state() { printf inactive; }
+    postflight() { return 0; }
+    if perform_update safe >/dev/null 2>&1; then
+        printf 'FAIL: apt-get upgrade failure was reported as success\n' >&2
+        exit 1
+    fi
+) || ((failures++))
 
 if (( failures > 0 )); then
     printf '%d auto-update test(s) failed\n' "$failures" >&2
