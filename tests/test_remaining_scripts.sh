@@ -43,14 +43,39 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
     export SWAPFILE="$TMP_ROOT/swapfile"
     export FSTAB_FILE="$TMP_ROOT/fstab"
     export LOG_FILE="$TMP_ROOT/swap.log"
-    : > "$FSTAB_FILE"
+    export BACKUP_ROOT="$TMP_ROOT/swap-backups"
+    export MIN_FREE_AFTER_MB=256
+    printf '# fixture\n%s none swap defaults 0 0\n%s none swap sw 0 0\n%s-extra none swap sw 0 0\n' \
+        "$SWAPFILE" "$SWAPFILE" "$SWAPFILE" > "$FSTAB_FILE"
     # shellcheck source=../snapfile.sh
     source "$ROOT_DIR/snapfile.sh"
     ensure_fstab_entry
     ensure_fstab_entry
     [[ $(grep -Fxc "$SWAPFILE none swap sw 0 0" "$FSTAB_FILE") -eq 1 ]] || fail "swap fstab entry is not idempotent"
-    swapon() { printf '%s\n' "$SWAPFILE"; }
+    grep -Fqx "$SWAPFILE-extra none swap sw 0 0" "$FSTAB_FILE" || fail "swap fstab rewrite removed a similarly named path"
+    remove_fstab_entry
+    if fstab_has_swap; then fail "swap fstab entry was not removed"; fi
+    grep -Fqx "$SWAPFILE-extra none swap sw 0 0" "$FSTAB_FILE" || fail "swap removal changed a similarly named path"
+
+    swapon() {
+        [[ " $* " == *' --show=NAME '* ]] || fail "swap detection did not request the NAME column"
+        printf '%s\n' "$SWAPFILE"
+    }
     is_swap_active || fail "exact active swap detection failed"
+
+    : > "$SWAPFILE"
+    ensure_fstab_entry
+    before_fstab=$(sha256sum "$FSTAB_FILE" | awk '{print $1}')
+    confirm() { return 1; }
+    swapoff() { fail "swapoff ran after delete cancellation"; }
+    is_swap_active() { return 0; }
+    disable_swap true
+    [[ -f "$SWAPFILE" ]] || fail "delete cancellation removed the swap file"
+    [[ $(sha256sum "$FSTAB_FILE" | awk '{print $1}') == "$before_fstab" ]] || fail "delete cancellation changed fstab"
+
+    available_mb() { printf '300\n'; }
+    if validate_size 45; then fail "swap size check did not preserve the free-space reserve"; fi
+    validate_size 44 || fail "swap size check rejected a valid size"
 )
 
 (
