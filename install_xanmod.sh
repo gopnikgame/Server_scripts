@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Version: 2.1.0
+# Version: 2.1.1
 # Description: Interactive XanMod installer for VLESS TCP servers
 # Repository: https://github.com/gopnikgame/Server_scripts
 # License: MIT
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 readonly LOG_FILE="${XANMOD_LOG_FILE:-/var/log/xanmod_install.log}"
 readonly STATE_FILE="${XANMOD_STATE_FILE:-/var/lib/server-scripts/xanmod.state}"
 readonly SYSCTL_CONFIG="${XANMOD_SYSCTL_CONFIG:-/etc/sysctl.d/90-server-scripts-vless-tcp.conf}"
@@ -278,13 +278,24 @@ setup_repository() {
     backup_file "$SOURCE_FILE" source-list >/dev/null
     local temporary_key
     temporary_key=$(mktemp)
-    curl -fsSL "$XANMOD_KEY_URL" -o "$temporary_key"
-    gpg --batch --yes --dearmor -o "$KEYRING_FILE" "$temporary_key"
+    if ! curl -fsSL "$XANMOD_KEY_URL" -o "$temporary_key"; then
+        rm -f "$temporary_key"
+        error "Не удалось скачать ключ репозитория XanMod"
+        return 1
+    fi
+    if ! gpg --batch --yes --dearmor -o "$KEYRING_FILE" "$temporary_key"; then
+        rm -f "$temporary_key"
+        error "Не удалось импортировать ключ репозитория XanMod"
+        return 1
+    fi
     rm -f "$temporary_key"
     chmod 644 "$KEYRING_FILE"
     printf 'deb [signed-by=%s] %s %s main\n' "$KEYRING_FILE" "$XANMOD_REPO_URL" "$OS_CODENAME" > "$SOURCE_FILE"
     chmod 644 "$SOURCE_FILE"
-    apt-get update
+    if ! apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=180 -o Acquire::https::Timeout=180 update; then
+        error "Не удалось обновить индексы APT после подключения репозитория XanMod"
+        return 1
+    fi
     success "Ключ и source list XanMod настроены"
 }
 
@@ -334,6 +345,23 @@ save_state() {
     chmod 600 "$STATE_FILE"
 }
 
+install_kernel_package() {
+    local package="$1" status
+    if ! DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Acquire::Retries=10 \
+        -o Acquire::http::Timeout=180 \
+        -o Acquire::https::Timeout=180 \
+        install -y "$package"; then
+        error "APT не смог установить $package. Состояние установки не записано; повторите попытку после восстановления доступа к репозиторию."
+        return 1
+    fi
+    status=$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)
+    if [[ "$status" != ii* ]]; then
+        error "APT завершился без ошибки, но пакет $package не имеет статуса installed (ii)."
+        return 1
+    fi
+}
+
 install_kernel_interactive() {
     require_root || return 1
     preflight_install || return 1
@@ -349,11 +377,14 @@ install_kernel_interactive() {
     printf 'Загрузчик:          %s\n' "$BOOTLOADER"
     printf 'Профиль сети:       будет применён только после загрузки XanMod\n'
     confirm "Установить выбранное ядро?" || return 0
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+    install_kernel_package "$package" || return 1
     if [[ "$BOOTLOADER" == grub ]] && command -v update-grub >/dev/null 2>&1; then
-        update-grub
+        if ! update-grub; then
+            error "Пакет установлен, но GRUB не удалось обновить. Не перезагружайте сервер до проверки загрузчика."
+            return 1
+        fi
     fi
-    save_state "$package"
+    save_state "$package" || { error "Пакет установлен, но состояние установки записать не удалось"; return 1; }
     success "Пакет установлен. Старое ядро не удалено."
     warn "Профиль VLESS TCP Stable ещё не применён: сначала нужно загрузить новое ядро."
     if confirm "Перезагрузить сервер сейчас? Убедитесь, что доступна консоль провайдера"; then

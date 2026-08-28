@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Version: 2.1.0
+# Version: 2.1.1
 # Description: Read-only kernel BBR/VLESS TCP status monitor
 
 set -u
@@ -10,6 +10,22 @@ readonly PROFILE_FILE="/etc/sysctl.d/90-server-scripts-vless-tcp.conf"
 
 value_or_unknown() {
     sysctl -n "$1" 2>/dev/null || printf 'unknown\n'
+}
+
+service_status() {
+    local status
+    status=$(systemctl is-active "$1" 2>/dev/null || true)
+    printf '%s\n' "${status:-не-найден}"
+}
+
+live_data_qdiscs() {
+    tc qdisc show 2>/dev/null | awk '$2 != "noqueue" {print $2}' | sort -u
+}
+
+live_qdiscs_are_fq() {
+    local qdiscs
+    qdiscs=$(live_data_qdiscs)
+    [[ -n "$qdiscs" ]] && [[ "$qdiscs" == fq ]]
 }
 
 show_status() {
@@ -22,22 +38,23 @@ show_status() {
     printf 'MTU probing:             %s\n' "$(value_or_unknown net.ipv4.tcp_mtu_probing)"
     printf 'SOMAXCONN:               %s\n' "$(value_or_unknown net.core.somaxconn)"
     printf 'SYN backlog:             %s\n' "$(value_or_unknown net.ipv4.tcp_max_syn_backlog)"
-    printf 'Xray service:            %s\n' "$(systemctl is-active xray 2>/dev/null || echo не-найден)"
+    printf 'Xray service:            %s\n' "$(service_status xray)"
     printf 'Профиль VLESS TCP:       %s\n' "$([[ -f "$PROFILE_FILE" ]] && echo установлен || echo не-установлен)"
+    printf 'Qdisc интерфейсов:       %s\n' "$(live_data_qdiscs | paste -sd, - || printf 'unknown')"
     printf '\n%bСокеты:%b\n' "$YELLOW" "$NC"
     ss -s 2>/dev/null || printf 'Команда ss недоступна\n'
     printf '\n%bОчереди интерфейсов:%b\n' "$YELLOW" "$NC"
     tc -s qdisc show 2>/dev/null || printf 'Команда tc недоступна\n'
     printf '\n'
     if [[ "$(value_or_unknown net.ipv4.tcp_congestion_control)" == bbr ]] &&
-        [[ "$(value_or_unknown net.core.default_qdisc)" == fq ]]; then
+        [[ "$(value_or_unknown net.core.default_qdisc)" == fq ]] && live_qdiscs_are_fq; then
         if [[ "$(uname -r)" == *xanmod* ]]; then
             printf '%bBBR загруженной сборки XanMod + fq активны.%b\n' "$GREEN" "$NC"
         else
             printf '%bBBR текущего ядра + fq активны.%b\n' "$GREEN" "$NC"
         fi
     else
-        printf '%bКонфигурация не полностью соответствует VLESS TCP Stable.%b\n' "$YELLOW" "$NC"
+        printf '%bКонфигурация не полностью соответствует VLESS TCP Stable, включая live qdisc интерфейсов.%b\n' "$YELLOW" "$NC"
     fi
 }
 

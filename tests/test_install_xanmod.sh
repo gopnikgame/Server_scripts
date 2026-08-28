@@ -79,6 +79,22 @@ curl() {
 }
 assert_true 'repository reachability accepts an HTTP 404 response' repo_reachable
 
+apt-get() { return 42; }
+dpkg-query() { printf 'ii '; }
+if install_kernel_package linux-xanmod-lts-x64v2 >/dev/null 2>&1; then
+    printf 'FAIL: failed apt install must propagate a non-zero status\n' >&2
+    ((failures++))
+fi
+apt-get() { return 0; }
+dpkg-query() { printf 'un '; }
+if install_kernel_package linux-xanmod-lts-x64v2 >/dev/null 2>&1; then
+    printf 'FAIL: package without ii status must be rejected\n' >&2
+    ((failures++))
+fi
+dpkg-query() { printf 'ii '; }
+assert_true 'successful apt plus ii status is accepted' install_kernel_package linux-xanmod-lts-x64v2
+unset -f apt-get dpkg-query
+
 sysctl() {
     if [[ "$1" == '-n' ]]; then
         case "$2" in

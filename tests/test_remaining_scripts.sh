@@ -58,6 +58,12 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
     source "$ROOT_DIR/bbr_info.sh"
     sysctl() { return 1; }
     [[ $(value_or_unknown net.ipv4.tcp_congestion_control) == unknown ]] || fail "BBR unknown fallback failed"
+    systemctl() { printf 'inactive\n'; return 3; }
+    [[ $(service_status xray) == inactive ]] || fail "inactive service status was duplicated"
+    tc() { printf 'qdisc noqueue 0: dev lo root\nqdisc fq_codel 0: dev eth0 root\n'; }
+    if live_qdiscs_are_fq; then fail "fq_codel live qdisc accepted as fq"; fi
+    tc() { printf 'qdisc noqueue 0: dev lo root\nqdisc fq 0: dev eth0 root\n'; }
+    live_qdiscs_are_fq || fail "fq live qdisc was rejected"
 )
 
 printf 'Remaining script tests: OK\n'
