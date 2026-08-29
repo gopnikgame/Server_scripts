@@ -35,7 +35,7 @@ readonly MODULE_ORDER
 
 declare -A MODULES=(
     [ubuntu_pre_install.sh]='Первоначальная настройка Ubuntu 24.04'
-    [setup_proxy.sh]='Настройка прокси сервера (HTTP / SSH+Privoxy / VPN / VLESS)'
+    [setup_proxy.sh]='Временные proxy-серверы и клиенты (HTTP / SOCKS5 / SSH SOCKS / VLESS)'
     [install_xanmod.sh]='Установка XanMod Kernel с BBR3'
     [bbr_info.sh]='Проверка и настройка конфигурации BBR'
     [snapfile.sh]='Управление файлом подкачки (Swap)'
