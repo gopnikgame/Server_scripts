@@ -1,8 +1,8 @@
 # 🚀 Server Scripts Manager
 
 ![Launcher](https://img.shields.io/badge/launcher-v2.0.2-blue)
-![Proxy](https://img.shields.io/badge/proxy--manager-v1.3.0--test-blueviolet)
-![Updated](https://img.shields.io/badge/updated-2026--08--18-green)
+![Proxy](https://img.shields.io/badge/proxy--manager-v2.0.0-blueviolet)
+![Updated](https://img.shields.io/badge/updated-2026--08--29-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04-orange)
 
@@ -30,7 +30,7 @@ wget -qO server_launcher.sh https://raw.githubusercontent.com/gopnikgame/Server_
 | # | Модуль | Назначение |
 |---|--------|-----------|
 | 1 | `ubuntu_pre_install.sh` | Первоначальная настройка Ubuntu 24.04 |
-| 2 | `setup_proxy.sh` | Настройка прокси (HTTP / SSH+Privoxy / VPN / VLESS) |
+| 2 | `setup_proxy.sh` | Временные proxy-серверы и подключения (HTTP / SOCKS5 / SSH SOCKS / VLESS-клиент) |
 | 3 | `install_xanmod.sh` | Установка XanMod Kernel с BBR3 |
 | 4 | `bbr_info.sh` | Проверка и настройка конфигурации BBR |
 | 5 | `snapfile.sh` | Управление файлом подкачки (Swap) |
@@ -96,35 +96,34 @@ UFW и SSH ранее прошли отдельные live-тесты со вт�
 
 ### 2 · Proxy Manager
 
-Настройка системного прокси для всех операций (`apt`, `curl`, `wget` и т.д.).  
-Прокси прописывается в `/etc/environment`, `/etc/profile.d/proxy.sh` и `/etc/apt/apt.conf.d/99proxy`.
+Один модуль используется с двух сторон: на доступном сервере он временно поднимает
+сервис, а на машине с блокировкой подключает его как системный proxy для `apt`,
+`curl`, `wget`, Git и других инструментов. Исходные proxy-файлы сохраняются и
+восстанавливаются при отключении.
 
 **Режимы:**
 
-| Пункт меню | Режим | Схема |
-|-----------|-------|-------|
-| 1 | HTTP прокси | Прямое подключение к HTTP/HTTPS прокси |
-| 2 | SSH + Privoxy | `ssh -D` (SOCKS5) → Privoxy → HTTP системный прокси |
-| 3 | VPN системный прокси | HTTP прокси от работающего VPN-клиента (Clash, Mihomo...) |
-| 4 | **Xray VLESS** | Вставить `vless://...` → Xray-core локально → HTTP `:10809` |
-| 5 | **Диагностика** | Проверяет блокировки и рекомендует нужный режим |
-| 6 | Обновить статус | Перечитать статус сервисов |
-| 7 | Отключить прокси | Удалить все настройки, остановить сервисы |
+| Роль | Возможности |
+|------|-------------|
+| Сервер | Временный HTTP или SOCKS5 с логином/паролем, UFW-доступом только от выбранного CIDR и таймером удаления |
+| Сервер SSH SOCKS | Проверка `sshd -T`; при необходимости временное разрешение local TCP-forwarding только выбранному SSH-пользователю и адресу |
+| Клиент | Пакет подключения HTTP/SOCKS5, готовый HTTP URL, SSH SOCKS через `socks5h`, существующая `vless://` ссылка |
+| Управление | Статус, проверка трафика, отдельное удаление клиентской и серверной сессий |
 
-**VLESS поддерживает:** REALITY+TCP, TLS+TCP/WS/gRPC, автоустановку `xray-core`.
+**VLESS поддерживается только на клиенте:** REALITY+TCP, TLS+TCP/WS/gRPC. Модуль
+никогда не создаёт, не изменяет и не удаляет VLESS-серверы.
 
-В тестовой версии `1.3.0-test` установка Xray загружает официальный release-архив
+Версия `2.0.0` загружает официальный release-архив Xray
 и соответствующий `.dgst`, проверяет SHA-256 и только затем устанавливает бинарный
 файл. Новый конфиг сначала проходит `xray run -test`, предыдущий конфиг сохраняется
 для rollback. VLESS UUID и реквизиты HTTP-прокси полностью показываются в
 интерактивном терминале для копирования, но не записываются в общий лог; файлы с
 реквизитами создаются с правами `0600`, Xray-конфиг — `0640`.
 
-> **Требуется тестирование на живой системе.** Локально проверены синтаксис,
-> парсинг входных данных, безопасная запись состояния и статические инварианты.
-> Установку/обновление Xray, systemd sandbox, перезапуск, rollback и реальный
-> VLESS TCP/REALITY-трафик нужно проверить на тестовом Debian/Ubuntu VPS с
-> доступом к консоли провайдера.
+На Ubuntu 24.04 проверены ShellCheck, HTTP и SOCKS5 серверы, UFW rollback,
+SSH-forwarding enable/rollback, SSH SOCKS с реальным HTTPS-запросом и удаление
+временных systemd-сервисов. Конкретную VLESS-ссылку следует проверять отдельно,
+так как серверная VLESS-инфраструктура намеренно находится вне управления модуля.
 
 ---
 
@@ -241,7 +240,8 @@ VLESS-нагрузка не проверялись.
 ## 🔥 Что делать, если что-то не устанавливается
 
 Некоторые ресурсы (GitHub, `deb.xanmod.org`, Docker Hub) могут быть заблокированы.  
-Запустите **встроенный диагностический мастер**: `setup_proxy.sh` → пункт **5 · Диагностика**.
+Запустите `setup_proxy.sh` на доступном сервере и выберите создание временного
+сервиса. На заблокированной машине запустите тот же модуль и выберите подключение.
 
 ### Логический маршрут
 
@@ -252,7 +252,7 @@ sudo ./server_launcher.sh
    Пункт 2 → setup_proxy.sh
          │
          ▼
-   5) Диагностика
+   1) Создать временный proxy-сервер
          │
          ├─ Нет интернета вообще? ──► ip route / ping 8.8.8.8 / resolvectl status
          │
@@ -260,46 +260,32 @@ sudo ./server_launcher.sh
          │
          └─ Ресурсы заблокированы?
                     │
-                    ├─ Есть VLESS ссылка? ─────────► 4) Xray VLESS
-                    │                                   вставить vless://... → готово
+                    ├─ Доступный второй сервер? ───► HTTP или SOCKS5 server
+                    │                                → скопировать пакет подключения
                     │
-                    ├─ Есть SSH-сервер за рубежом? ─► 2) SSH + Privoxy
-                    │                                   ssh-copy-id → ввести host/user
+                    ├─ Есть SSH-доступ? ───────────► SSH SOCKS server
+                    │                                → при запрете временно разрешит forwarding
+                    │                                → на клиенте указать host/user/key
                     │
-                    ├─ Работает VPN с HTTP прокси? ─► 3) VPN системный прокси
-                    │                                   указать адрес (:7890, :10809...)
+                    ├─ Есть VLESS ссылка? ─────────► Клиент → существующая vless://
+                    │                                сервер VLESS не изменяется
                     │
-                    ├─ Есть HTTP прокси? ──────────► 1) HTTP прокси
-                    │                                   указать адрес:порт
-                    │
-                    └─ Ничего нет?
-                               │
-                               ├─ Cloudflare WARP (бесплатно):
-                               │    curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
-                               │    warp-cli registration new
-                               │    warp-cli mode proxy && warp-cli connect
-                               │    → прокси: http://127.0.0.1:40001
-                               │    → затем пункт 3) VPN системный прокси
-                               │
-                               └─ Арендовать VPS (€3–5/мес):
-                                    DigitalOcean / Hetzner / Vultr / BuyVM
-                                    → поднять Xray-server → получить VLESS ссылку
-                                    → пункт 4) Xray VLESS
+                    └─ Есть готовый HTTP proxy? ───► Клиент → HTTP proxy URL
 ```
 
 ### Применение прокси к текущей SSH-сессии
 
 ```bash
-source /etc/profile.d/proxy.sh
+source /etc/profile.d/server-scripts-proxy.sh
 ```
 
 ### Отключение прокси после установки
 
 ```bash
-# Через меню: пункт 7) Отключить прокси
+# Через меню: пункт 4) Удалить клиентское подключение
 
 # Для текущей сессии вручную:
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
 ```
 
 ### Типичные ошибки (не блокировки)
@@ -358,8 +344,10 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
 - Кеширование, защита от DNS-утечек
 
 **Прокси:**
-- Все настройки изолированы, полностью удаляются через пункт «Отключить прокси»
-- Оригинальный конфиг Privoxy сохраняется в `/etc/privoxy/config.orig`
+- Модуль управляет только собственными `server-scripts-proxy-*` units и файлами
+- HTTP/SOCKS5 ограничиваются выбранным client CIDR через UFW
+- SSH forwarding разрешается только выбранным user/address и откатывается при удалении
+- Исходные `/etc/environment`, APT и profile-файлы восстанавливаются из root-only backup
 
 ---
 
@@ -372,8 +360,9 @@ tail -f /var/log/server-scripts/server-scripts.log
 # Proxy Manager
 tail -f /var/log/server-scripts/setup_proxy.log
 
-# Xray
-tail -f /var/log/xray/error.log
+# Временный Xray server/client
+journalctl -u server-scripts-proxy-server.service -f
+journalctl -u server-scripts-proxy-client.service -f
 journalctl -u xray -f
 
 # SSH туннель
@@ -439,4 +428,4 @@ MIT License © 2025 [gopnikgame](https://github.com/gopnikgame)
 
 ---
 
-**Launcher:** v1.1.0 · **Proxy Manager:** v1.3.0 · **Дата:** 2026-08-18 · **Автор:** gopnikgame
+**Launcher:** v2.0.2 · **Proxy Manager:** v2.0.0 · **Дата:** 2026-08-29 · **Автор:** gopnikgame
